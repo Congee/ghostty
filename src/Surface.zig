@@ -4015,6 +4015,43 @@ pub fn mouseButtonCallback(
         const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
 
         const pos = try self.rt_surface.getCursorPos();
+
+        // Check if the click is in the status bar area (below the grid).
+        // If so, determine which tab was clicked and switch to it.
+        if (self.config.status_bar_enabled) status_bar_click: {
+            const grid_rows = t.screens.active.pages.rows;
+            const grid_bottom: f64 = @as(f64, @floatFromInt(self.size.padding.top)) +
+                @as(f64, @floatFromInt(grid_rows)) *
+                @as(f64, @floatFromInt(self.size.cell.height));
+
+            if (pos.y >= grid_bottom) {
+                // Click is in the status bar. Map x position to a tab index
+                // by computing which character column was clicked and matching
+                // against the rendered status bar tab segments.
+                const click_col: usize = col: {
+                    const x_in_bar = pos.x - @as(f64, @floatFromInt(self.size.padding.left));
+                    if (x_in_bar < 0) break :status_bar_click;
+                    break :col @intFromFloat(x_in_bar / @as(f64, @floatFromInt(self.size.cell.width)));
+                };
+
+                // Parse the status bar left text to find tab boundaries.
+                // Format: " [0:name*] 1:name 2:name"
+                // Each tab segment has a known start/end column.
+                if (self.renderer_state.status_bar) |sb| {
+                    const tab_index = self.findTabAtColumn(sb.left, click_col);
+                    if (tab_index) |idx| {
+                        _ = self.rt_app.performAction(
+                            .{ .surface = self },
+                            .goto_tab,
+                            @as(apprt.action.GotoTab, @enumFromInt(@as(c_int, @intCast(idx + 1)))),
+                        ) catch {};
+                        return true;
+                    }
+                }
+                break :status_bar_click;
+            }
+        }
+
         const pin = pin: {
             const pt_viewport = self.posToViewport(pos.x, pos.y);
             const pin = screen.pages.pin(.{
@@ -5047,6 +5084,45 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // If mode 2031 is on, then we report the change live.
     self.queueIo(.{ .color_scheme_report = .{ .force = false } }, .unlocked);
+}
+
+/// Find which tab index corresponds to a column position in the status bar.
+/// Returns null if the column doesn't fall within any tab segment.
+/// Parses the status bar text format: " [0:name*] 1:name 2:name"
+fn findTabAtColumn(self: *const Surface, status_text: []const u8, col: usize) ?usize {
+    _ = self;
+    // Walk through the text tracking column position and current tab index.
+    // Tab segments are identified by the pattern: digit followed by ':'
+    var text_col: usize = 0;
+    var i: usize = 0;
+    var current_tab: ?usize = null;
+    var tab_start_col: usize = 0;
+
+    while (i < status_text.len) : (i += 1) {
+        const c = status_text[i];
+
+        // Detect start of a tab segment: a digit followed by ':'
+        if (c >= '0' and c <= '9' and i + 1 < status_text.len and status_text[i + 1] == ':') {
+            // If we had a previous tab and the click falls in its range, return it
+            if (current_tab != null and col >= tab_start_col and col < text_col) {
+                return current_tab;
+            }
+            current_tab = c - '0';
+            // Handle multi-digit tab indices
+            var j = i + 1;
+            while (j < status_text.len and status_text[j] >= '0' and status_text[j] <= '9') : (j += 1) {}
+            tab_start_col = text_col;
+        }
+
+        text_col += 1;
+    }
+
+    // Check last tab segment
+    if (current_tab != null and col >= tab_start_col and col < text_col) {
+        return current_tab;
+    }
+
+    return null;
 }
 
 pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordinate {

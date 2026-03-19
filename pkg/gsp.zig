@@ -172,41 +172,6 @@ pub const DeltaRowHeader = extern struct {
     }
 };
 
-// ── Compression ──
-
-/// Compress data using deflate. Returns compressed buffer (caller owns).
-/// Used for FULL_STATE and large DELTA messages over slow links.
-pub fn compress(alloc: Allocator, data: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    var fbs = std.io.fixedBufferStream(data);
-    var comp = std.compress.flate.compressor(.default, fbs.reader());
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = comp.read(&buf) catch return error.CompressionFailed;
-        if (n == 0) break;
-        try out.appendSlice(alloc, buf[0..n]);
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-/// Decompress deflate data. Returns decompressed buffer (caller owns).
-pub fn decompress(alloc: Allocator, data: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    var fbs = std.io.fixedBufferStream(data);
-    var dec = std.compress.flate.decompressor(fbs.reader());
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = dec.read(&buf) catch return error.DecompressionFailed;
-        if (n == 0) break;
-        try out.appendSlice(alloc, buf[0..n]);
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
 // ── Encoding ──
 
 /// Encode a message into a freshly allocated buffer: header + payload.

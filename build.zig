@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) !void {
     ) orelse &[0][]const u8{};
 
     // Ghostty dependencies used by many artifacts.
-    const deps = try buildpkg.SharedDeps.init(b, &config);
+    var deps = try buildpkg.SharedDeps.init(b, &config);
 
     // The modules exported for Zig consumers of libghostty. If you're
     // writing a Zig program that uses libghostty, read this file.
@@ -81,17 +81,15 @@ pub fn build(b: *std.Build) !void {
     const resources = try buildpkg.GhosttyResources.init(b, &config, &deps);
     const i18n = if (config.i18n) try buildpkg.GhosttyI18n.init(b, &config) else null;
 
-    // Ghostty executable, the actual runnable Ghostty program.
-    const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
-
-    // GSP protocol module (shared between exe CLI commands and daemon)
+    // GSP protocol module — added to every build target via SharedDeps.
+    // The terminal (vt) module is imported via relative path from daemon code.
     const gsp_mod = b.createModule(.{
         .root_source_file = b.path("pkg/gsp.zig"),
     });
-    exe.exe.root_module.addImport("gsp", gsp_mod);
-    exe.exe.root_module.addImport("vt", mod.vt);
+    deps.gsp_module = gsp_mod;
 
-    // Daemon runs in-process via ghostty +daemon (no separate binary).
+    // Ghostty executable, the actual runnable Ghostty program.
+    const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
@@ -44,7 +45,7 @@ pub fn run(alloc: Allocator) !u8 {
     // Wait for daemon to be ready (up to 5 seconds)
     var attempts: u32 = 0;
     while (attempts < 50) : (attempts += 1) {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
         if (isDaemonRunning(alloc, socket_path)) {
             try stdout.print("Daemon started at {s}\n", .{socket_path});
             try stdout.flush();
@@ -115,27 +116,30 @@ fn startDaemon(socket_path: []const u8) !void {
     }
 
     // Redirect stdin/stdout to /dev/null, keep stderr for logging
-    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
     if (devnull >= 0) {
         _ = std.c.dup2(devnull, 0);
         _ = std.c.dup2(devnull, 1);
         if (devnull > 2) _ = std.c.close(devnull);
     }
 
-    // Run daemon main loop in-process (same binary, forked grandchild)
-    const daemon_main = @import("../daemon/main.zig");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc2 = gpa.allocator();
+    // Run daemon main loop in-process (same binary, forked grandchild).
+    // Only available on platforms with fork/PTY support.
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .linux or builtin.os.tag == .freebsd) {
+        const daemon_main = @import("../daemon/main.zig");
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const daemon_alloc = gpa.allocator();
 
-    const SessionManager = @import("../daemon/SessionManager.zig");
-    var session_mgr = SessionManager.init(alloc2);
+        const SessionManager = @import("../daemon/SessionManager.zig");
+        var session_mgr = SessionManager.init(daemon_alloc);
 
-    std.fs.cwd().deleteFile(socket_path) catch {};
-    daemon_main.runUnixListener(alloc2, socket_path, &session_mgr, "") catch |err| {
-        std.log.err("daemon listener failed: {}", .{err});
-    };
+        std.fs.cwd().deleteFile(socket_path) catch {};
+        daemon_main.runUnixListener(daemon_alloc, socket_path, &session_mgr, "") catch |err| {
+            std.log.err("daemon listener failed: {}", .{err});
+        };
 
-    session_mgr.deinit();
+        session_mgr.deinit();
+    }
     std.c.exit(0);
 }
 

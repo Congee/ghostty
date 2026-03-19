@@ -14,6 +14,9 @@ config: *const Config,
 
 options: *std.Build.Step.Options,
 help_strings: HelpStrings,
+
+/// GSP protocol module added to every build target (set after init).
+gsp_module: ?*std.Build.Module = null,
 metallib: ?*MetallibStep,
 unicode_tables: UnicodeTables,
 framedata: GhosttyFrameData,
@@ -152,6 +155,9 @@ pub fn add(
         }
         step.root_module.addImport("locale-c", c.createModule());
     }
+
+    // GSP protocol module for daemon CLI commands
+    if (self.gsp_module) |gsp_mod| step.root_module.addImport("gsp", gsp_mod);
 
     // C imports needed to manage/create PTYs
     switch (target.result.os.tag) {

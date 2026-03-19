@@ -2648,9 +2648,9 @@ pub fn refreshStatusBar(self: *Surface) !void {
     if (!self.config.status_bar_enabled) return;
 
     // Build VT escape sequence buffer
-    var buf = std.ArrayList(u8).init(self.alloc);
-    defer buf.deinit();
-    const w = buf.writer();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(self.alloc);
+    const w = buf.writer(self.alloc);
 
     // Get terminal dimensions
     const t = self.renderer_state.terminal;
@@ -2670,8 +2670,8 @@ pub fn refreshStatusBar(self: *Surface) !void {
     try w.writeAll("\x1b[7m"); // Reverse video for status bar background
     try w.writeAll("\x1b[K"); // Clear line
 
-    var click_regions = std.ArrayList(rendererpkg.State.ClickRegion).init(self.alloc);
-    defer click_regions.deinit();
+    var click_regions: std.ArrayListUnmanaged(rendererpkg.State.ClickRegion) = .empty;
+    defer click_regions.deinit(self.alloc);
     var col_pos: u16 = 0;
 
     // ── Phase 1: Calculate tab width (always highest priority) ──
@@ -2724,7 +2724,7 @@ pub fn refreshStatusBar(self: *Surface) !void {
             col_pos += comp_width;
             left_budget -= comp_width;
             if (comp.click) |cl| {
-                try click_regions.append(.{
+                try click_regions.append(self.alloc, .{
                     .x_start = start,
                     .x_end = col_pos,
                     .click_id = cl.id,
@@ -2758,7 +2758,7 @@ pub fn refreshStatusBar(self: *Surface) !void {
             col_pos += 1;
         }
 
-        try click_regions.append(.{
+        try click_regions.append(self.alloc, .{
             .x_start = tab_start,
             .x_end = col_pos,
             .click_id = "",
@@ -2794,7 +2794,7 @@ pub fn refreshStatusBar(self: *Surface) !void {
                 try writeComponentEsc(w, comp);
                 col_pos += cw;
                 if (comp.click) |cl| {
-                    try click_regions.append(.{
+                    try click_regions.append(self.alloc, .{
                         .x_start = start,
                         .x_end = col_pos,
                         .click_id = cl.id,
@@ -2812,7 +2812,7 @@ pub fn refreshStatusBar(self: *Surface) !void {
         defer self.renderer_state.mutex.unlock();
         if (self.renderer_state.status_bar) |*live_sb| {
             if (live_sb.click_regions.len > 0) self.alloc.free(live_sb.click_regions);
-            live_sb.click_regions = try click_regions.toOwnedSlice();
+            live_sb.click_regions = try click_regions.toOwnedSlice(self.alloc);
         }
     }
 

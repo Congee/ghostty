@@ -62,8 +62,8 @@ pub fn renderRight(self: *const StatusBarWidget, ctx: Context) ![]u8 {
 }
 
 fn render(self: *const StatusBarWidget, fmt: []const u8, ctx: Context) ![]u8 {
-    var result = std.ArrayList(u8).init(self.alloc);
-    errdefer result.deinit();
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(self.alloc);
 
     var i: usize = 0;
     while (i < fmt.len) {
@@ -75,26 +75,26 @@ fn render(self: *const StatusBarWidget, fmt: []const u8, ctx: Context) ![]u8 {
                 continue;
             }
         }
-        try result.append(fmt[i]);
+        try result.append(self.alloc, fmt[i]);
         i += 1;
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(self.alloc);
 }
 
-fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const u8, ctx: Context) !void {
+fn expandTag(self: *const StatusBarWidget, out: *std.ArrayListUnmanaged(u8), tag: []const u8, ctx: Context) !void {
     _ = self;
 
     if (std.mem.eql(u8, tag, "session")) {
         if (ctx.session) |s| {
-            try out.appendSlice(s.displayLabel());
+            try out.appendSlice(self.alloc,s.displayLabel());
         }
         return;
     }
 
     if (std.mem.eql(u8, tag, "title")) {
         if (ctx.session) |s| {
-            if (s.title) |t| try out.appendSlice(t);
+            if (s.title) |t| try out.appendSlice(self.alloc,t);
         }
         return;
     }
@@ -105,9 +105,9 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
             if (info.pwd) |pwd| {
                 // Show basename only
                 if (std.mem.lastIndexOfScalar(u8, pwd, '/')) |idx| {
-                    try out.appendSlice(pwd[idx + 1 ..]);
+                    try out.appendSlice(self.alloc,pwd[idx + 1 ..]);
                 } else {
-                    try out.appendSlice(pwd);
+                    try out.appendSlice(self.alloc,pwd);
                 }
             }
         }
@@ -121,9 +121,9 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
                 const name = std.mem.sliceTo(cmd, 0);
                 // Show basename of command
                 if (std.mem.lastIndexOfScalar(u8, name, '/')) |idx| {
-                    try out.appendSlice(name[idx + 1 ..]);
+                    try out.appendSlice(self.alloc,name[idx + 1 ..]);
                 } else {
-                    try out.appendSlice(name);
+                    try out.appendSlice(self.alloc,name);
                 }
             }
         }
@@ -133,24 +133,24 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
     if (std.mem.eql(u8, tag, "tabs")) {
         if (ctx.tabs.len == 0) return;
         for (ctx.tabs, 0..) |tab, i| {
-            if (i > 0) try out.append(' ');
+            if (i > 0) try out.append(self.alloc,' ');
             // Format: [index:label] for active, [index:label] for all
-            try out.append('[');
+            try out.append(self.alloc,'[');
             var idx_buf: [10]u8 = undefined;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{tab.index}) catch return;
-            try out.appendSlice(idx_str);
-            try out.append(':');
-            try out.appendSlice(tab.label);
-            if (tab.is_active) try out.append('*');
-            try out.append(']');
+            try out.appendSlice(self.alloc,idx_str);
+            try out.append(self.alloc,':');
+            try out.appendSlice(self.alloc,tab.label);
+            if (tab.is_active) try out.append(self.alloc,'*');
+            try out.append(self.alloc,']');
         }
         return;
     }
 
     if (std.mem.eql(u8, tag, "prefix")) {
         if (ctx.prefix_active) {
-            try out.appendSlice(ctx.prefix_key orelse "^B");
-            try out.appendSlice("-");
+            try out.appendSlice(self.alloc,ctx.prefix_key orelse "^B");
+            try out.appendSlice(self.alloc,"-");
         }
         return;
     }
@@ -162,12 +162,12 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
         const minutes = (day_seconds % 3600) / 60;
         var buf: [5]u8 = undefined;
         _ = std.fmt.bufPrint(&buf, "{d:0>2}:{d:0>2}", .{ hours, minutes }) catch return;
-        try out.appendSlice(&buf);
+        try out.appendSlice(self.alloc,&buf);
         return;
     }
 
     // Unknown tag — pass through as literal
-    try out.append('{');
-    try out.appendSlice(tag);
-    try out.append('}');
+    try out.append(self.alloc,'{');
+    try out.appendSlice(self.alloc,tag);
+    try out.append(self.alloc,'}');
 }

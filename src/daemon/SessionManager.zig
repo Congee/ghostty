@@ -10,7 +10,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Protocol = @import("gsp");
 const PtyReader = @import("PtyReader.zig");
-const vt = @import("vt");
+const vt = @import("../terminal/main.zig");
 
 const log = std.log.scoped(.session_mgr);
 

@@ -126,3 +126,19 @@ fn startDaemon(socket_path: []const u8) !void {
     session_mgr.deinit();
     std.c.exit(0);
 }
+
+// ── Tests ──
+
+test "getSocketPath returns default" {
+    const path = getSocketPath();
+    try std.testing.expectEqualStrings("/tmp/ghostty.sock", path);
+}
+
+test "isDaemonRunning returns false for nonexistent socket" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!isDaemonRunning(alloc, "/tmp/ghostty-test-nonexistent-99999.sock"));
+}
+
+test "default_socket is /tmp/ghostty.sock" {
+    try std.testing.expectEqualStrings("/tmp/ghostty.sock", default_socket);
+}

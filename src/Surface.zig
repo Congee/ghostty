@@ -2816,9 +2816,8 @@ pub fn refreshStatusBar(self: *Surface) !void {
         }
     }
 
-    // Restore scroll region to full screen (DECSTBM is NOT saved by DECSC,
-    // so we must explicitly reset it before restoring cursor).
-    try w.writeAll("\x1b[r"); // Reset DECSTBM to full screen
+    // Restore cursor and attributes. Keep DECSTBM at 1..N-1 so the shell
+    // cannot scroll into the status bar row.
     try w.writeAll("\x1b[0m"); // Reset attributes
     try w.writeAll("\x1b8"); // DECRC
 

@@ -4791,6 +4791,7 @@ pub fn finalize(self: *Config) !void {
     // set these options will have their values overridden.
     if (self.@"status-bar") {
         self.@"window-show-tab-bar" = .never;
+        self.@"macos-titlebar-style" = .hidden;
     }
 }
 

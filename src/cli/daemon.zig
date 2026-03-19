@@ -131,7 +131,9 @@ fn startDaemon(socket_path: []const u8) !void {
     var session_mgr = SessionManager.init(alloc2);
 
     std.fs.cwd().deleteFile(socket_path) catch {};
-    daemon_main.runUnixListener(alloc2, socket_path, &session_mgr, "") catch {};
+    daemon_main.runUnixListener(alloc2, socket_path, &session_mgr, "") catch |err| {
+        std.log.err("daemon listener failed: {}", .{err});
+    };
 
     session_mgr.deinit();
     std.c.exit(0);

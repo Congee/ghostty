@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) !void {
 
     // All our steps which we'll hook up later. The steps are shown
     // up here just so that they are more self-documenting.
-    const daemon_step = b.step("daemon", "Build ghostty-daemon");
+    // daemon step removed — daemon runs in-process via ghostty +daemon
     const run_step = b.step("run", "Run the app");
     const run_valgrind_step = b.step(
         "run-valgrind",
@@ -91,9 +91,7 @@ pub fn build(b: *std.Build) !void {
     exe.exe.root_module.addImport("gsp", gsp_mod);
     exe.exe.root_module.addImport("vt", mod.vt);
 
-    // Ghostty daemon — standalone session server with libghostty-vt terminal emulation.
-    const daemon = try buildpkg.GhosttyDaemon.init(b, &config, mod.vt, gsp_mod);
-    daemon_step.dependOn(&daemon.install_step.step);
+    // Daemon runs in-process via ghostty +daemon (no separate binary).
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);

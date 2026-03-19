@@ -1,0 +1,258 @@
+//! ControlSocket provides a Unix domain socket interface for external
+//! tools to control the status bar and query session state.
+//!
+//! Protocol: line-based text commands over a Unix stream socket.
+//!   SET-STATUS-LEFT <text>    — Set left status bar text
+//!   SET-STATUS-RIGHT <text>   — Set right status bar text
+//!   SET-STATUS <left> | <right> — Set both (pipe-separated)
+//!   CLEAR-STATUS              — Clear the status bar
+//!   LIST-SESSIONS             — List all sessions (JSON response)
+//!   LIST-TABS                 — List tabs with index, title, active flag (JSON)
+//!   GET-FOCUSED               — Get focused tab index and session info (JSON)
+//!   RENAME-TAB <name>         — Rename the focused tab
+//!   PING                      — Health check (responds PONG)
+//!
+//! Each command is a single line terminated by \n.
+//! Responses are single lines terminated by \n.
+const ControlSocket = @This();
+
+const std = @import("std");
+const posix = std.posix;
+const Allocator = std.mem.Allocator;
+const Surface = @import("Surface.zig");
+const App = @import("App.zig");
+
+const log = std.log.scoped(.control_socket);
+
+alloc: Allocator,
+path: []const u8,
+socket_fd: ?posix.socket_t = null,
+listen_thread: ?std.Thread = null,
+running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+/// The app to query for sessions.
+app: *App,
+
+/// The surface to update (for status bar). This is the focused surface.
+/// Updated on each command by looking at app.focused_surface.
+surface_fn: *const fn (*App) ?*Surface,
+
+pub fn init(
+    alloc: Allocator,
+    app: *App,
+    socket_path: ?[]const u8,
+) !ControlSocket {
+    // Determine socket path
+    const path = if (socket_path) |p|
+        try alloc.dupe(u8, p)
+    else
+        try std.fmt.allocPrint(alloc, "/tmp/ghostty-ctl-{d}.sock", .{std.c.getpid()});
+
+    return .{
+        .alloc = alloc,
+        .path = path,
+        .app = app,
+        .surface_fn = &getFocusedCoreSurface,
+    };
+}
+
+fn getFocusedCoreSurface(app: *App) ?*Surface {
+    return app.focused_surface;
+}
+
+pub fn deinit(self: *ControlSocket) void {
+    self.stop();
+    if (self.socket_fd) |fd| {
+        posix.close(fd);
+        self.socket_fd = null;
+    }
+    // Remove the socket file
+    std.fs.cwd().deleteFile(self.path) catch {};
+    self.alloc.free(self.path);
+}
+
+pub fn start(self: *ControlSocket) !void {
+    // Remove stale socket file
+    std.fs.cwd().deleteFile(self.path) catch {};
+
+    // Create and bind the socket
+    const addr = try std.net.Address.initUnix(self.path);
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    errdefer posix.close(fd);
+
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    try posix.listen(fd, 5);
+    self.socket_fd = fd;
+    self.running.store(true, .release);
+
+    log.info("control socket listening on {s}", .{self.path});
+
+    // Start accept loop in background thread
+    self.listen_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+    self.listen_thread.?.setName("ctl-sock") catch {};
+}
+
+pub fn stop(self: *ControlSocket) void {
+    self.running.store(false, .release);
+    // Close the listening socket to unblock accept
+    if (self.socket_fd) |fd| {
+        posix.close(fd);
+        self.socket_fd = null;
+    }
+    if (self.listen_thread) |t| {
+        t.join();
+        self.listen_thread = null;
+    }
+}
+
+fn acceptLoop(self: *ControlSocket) void {
+    while (self.running.load(.acquire)) {
+        const fd = self.socket_fd orelse return;
+        const conn = posix.accept(fd, null, null, 0) catch |err| {
+            if (!self.running.load(.acquire)) return;
+            log.warn("accept error: {}", .{err});
+            continue;
+        };
+        defer posix.close(conn);
+        self.handleConnection(conn);
+    }
+}
+
+fn handleConnection(self: *ControlSocket, conn: posix.socket_t) void {
+    var buf: [4096]u8 = undefined;
+    const n = posix.read(conn, &buf) catch |err| {
+        log.warn("read error: {}", .{err});
+        return;
+    };
+    if (n == 0) return;
+
+    const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
+
+    // Commands that return dynamic content use the response buffer
+    var resp_buf: [8192]u8 = undefined;
+    const response = self.handleCommand(line, &resp_buf) catch |err| {
+        const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return;
+        _ = posix.write(conn, msg) catch {};
+        return;
+    };
+
+    _ = posix.write(conn, response) catch {};
+}
+
+fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]const u8 {
+    if (std.mem.startsWith(u8, line, "PING")) {
+        return "PONG\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "CLEAR-STATUS")) {
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        try surface.setStatusBar(null, null);
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "SET-STATUS-LEFT ")) {
+        const text = line["SET-STATUS-LEFT ".len..];
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        try surface.setStatusBar(text, null);
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "SET-STATUS-RIGHT ")) {
+        const text = line["SET-STATUS-RIGHT ".len..];
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        try surface.setStatusBar(null, text);
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "SET-STATUS ")) {
+        const text = line["SET-STATUS ".len..];
+        // Split on " | "
+        if (std.mem.indexOf(u8, text, " | ")) |idx| {
+            const left = text[0..idx];
+            const right = text[idx + 3 ..];
+            const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+            try surface.setStatusBar(left, right);
+        } else {
+            const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+            try surface.setStatusBar(text, null);
+        }
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "LIST-SESSIONS")) {
+        self.app.logSessions();
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "LIST-TABS")) {
+        return self.listTabs(resp_buf);
+    }
+
+    if (std.mem.startsWith(u8, line, "GET-FOCUSED")) {
+        return self.getFocused(resp_buf);
+    }
+
+    if (std.mem.startsWith(u8, line, "RENAME-TAB ")) {
+        const name = line["RENAME-TAB ".len..];
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        surface.session.setName(name) catch return "ERR alloc failed\n";
+        surface.refreshStatusBar() catch {};
+        return "OK\n";
+    }
+
+    return "ERR unknown command\n";
+}
+
+/// LIST-TABS: returns JSON array of tab info.
+/// Format: [{"index":0,"title":"zsh","active":true}, ...]
+fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
+    const focused = self.surface_fn(self.app);
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeByte('[') catch return "ERR buffer overflow\n";
+
+    for (self.app.surfaces.items, 0..) |surf, i| {
+        const core = &surf.core_surface;
+        const label = if (core.session.name) |n|
+            @as([]const u8, n)
+        else if (core.session.title) |t|
+            @as([]const u8, t)
+        else
+            "shell";
+        const is_active = if (focused) |f| (core == f) else false;
+
+        if (i > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
+        std.fmt.format(w, "{{\"index\":{d},\"title\":\"{s}\",\"active\":{s}}}", .{
+            i, label, if (is_active) "true" else "false",
+        }) catch return "ERR buffer overflow\n";
+    }
+
+    w.writeAll("]\n") catch return "ERR buffer overflow\n";
+    return fbs.getWritten();
+}
+
+/// GET-FOCUSED: returns JSON with focused tab info.
+fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
+    const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+
+    // Find the index of the focused surface
+    var idx: usize = 0;
+    for (self.app.surfaces.items, 0..) |surf, i| {
+        if (&surf.core_surface == surface) {
+            idx = i;
+            break;
+        }
+    }
+
+    const info = surface.session.getInfo();
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    std.fmt.format(w, "{{\"index\":{d},\"id\":{d},\"name\":\"{s}\",\"title\":\"{s}\",\"tabs\":{d}}}\n", .{
+        idx,
+        info.id,
+        info.name orelse "",
+        info.title orelse "",
+        self.app.surfaces.items.len,
+    }) catch return "ERR buffer overflow\n";
+    return fbs.getWritten();
+}

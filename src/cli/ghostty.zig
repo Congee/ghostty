@@ -22,6 +22,7 @@ const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const daemon_cmd = @import("daemon.zig");
 const session_cmd = @import("session.zig");
+const connect_cmd = @import("connect.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -80,6 +81,9 @@ pub const Action = enum {
 
     /// Manage daemon sessions (list, create, attach, destroy)
     session,
+
+    /// Connect to a remote daemon (TCP or Unix socket)
+    connect,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -162,6 +166,7 @@ pub const Action = enum {
             .@"new-window" => try new_window.run(alloc),
             .daemon => try daemon_cmd.run(alloc),
             .session => try session_cmd.run(alloc),
+            .connect => try connect_cmd.run(alloc),
         };
     }
 
@@ -202,6 +207,9 @@ pub const Action = enum {
                 .@"show-face" => show_face.Options,
                 .boo => boo.Options,
                 .@"new-window" => new_window.Options,
+                .daemon => daemon_cmd.Options,
+                .session => session_cmd.Options,
+                .connect => connect_cmd.Options,
             };
         }
     }

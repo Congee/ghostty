@@ -65,6 +65,11 @@ underline: bool = false,
 strikethrough: bool = false,
 inverse: bool = false,
 
+/// UTF-8 multi-byte accumulation.
+utf8_buf: [4]u8 = undefined,
+utf8_len: u8 = 0,
+utf8_expected: u8 = 0,
+
 /// Scroll region (top and bottom, 0-indexed, inclusive).
 scroll_top: u16 = 0,
 scroll_bottom: u16 = 0, // Set to rows-1 on init
@@ -105,14 +110,22 @@ pub fn feed(self: *VtParser, session: *SessionManager.DaemonSession, data: []con
 }
 
 fn processByte(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void {
+    // If we're not in ground state, discard any in-progress UTF-8 sequence.
+    // This prevents stale utf8_expected from misinterpreting bytes after
+    // an escape sequence interrupts a multi-byte character.
+    if (self.state != .ground and self.utf8_expected > 0) {
+        self.utf8_expected = 0;
+        self.utf8_len = 0;
+    }
+
     switch (self.state) {
         .ground => self.processGround(s, byte),
         .escape => self.processEscape(s, byte),
         .escape_intermediate => self.processEscapeIntermediate(s, byte),
         .csi_entry => self.processCsiEntry(s, byte),
         .csi_param => self.processCsiParam(s, byte),
-        .osc_string => self.processOscString(byte),
-        .osc_string_escape => self.processOscStringEscape(byte),
+        .osc_string => self.processOscString(s, byte),
+        .osc_string_escape => self.processOscStringEscape(s, byte),
         .dcs_string => self.processDcsApcString(byte),
         .dcs_string_escape => self.processDcsApcStringEscape(byte),
         .apc_string => self.processDcsApcString(byte),
@@ -121,6 +134,25 @@ fn processByte(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void
 }
 
 fn processGround(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void {
+    // Handle UTF-8 continuation bytes
+    if (self.utf8_expected > 0) {
+        if (byte & 0xC0 == 0x80) {
+            self.utf8_buf[self.utf8_len] = byte;
+            self.utf8_len += 1;
+            if (self.utf8_len == self.utf8_expected) {
+                const cp = decodeUtf8(self.utf8_buf[0..self.utf8_len]);
+                self.utf8_expected = 0;
+                self.utf8_len = 0;
+                self.putChar(s, cp);
+            }
+            return;
+        } else {
+            // Invalid continuation — discard accumulated bytes
+            self.utf8_expected = 0;
+            self.utf8_len = 0;
+        }
+    }
+
     switch (byte) {
         0x1b => self.state = .escape,
         '\r' => s.cursor_x = 0,
@@ -133,7 +165,22 @@ fn processGround(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) vo
         0x08 => s.cursor_x -|= 1, // BS
         0x07 => {}, // BEL — ignore
         0x00...0x06, 0x0e...0x1a, 0x1c...0x1f => {}, // Other C0 — ignore
-        else => self.putChar(s, byte),
+        0xC2...0xDF => { // 2-byte UTF-8 lead (0xC0-0xC1 are overlong, rejected)
+            self.utf8_buf[0] = byte;
+            self.utf8_len = 1;
+            self.utf8_expected = 2;
+        },
+        0xE0...0xEF => { // 3-byte UTF-8 lead
+            self.utf8_buf[0] = byte;
+            self.utf8_len = 1;
+            self.utf8_expected = 3;
+        },
+        0xF0...0xF7 => { // 4-byte UTF-8 lead
+            self.utf8_buf[0] = byte;
+            self.utf8_len = 1;
+            self.utf8_expected = 4;
+        },
+        else => self.putChar(s, @as(u32, byte)),
     }
 }
 
@@ -256,12 +303,12 @@ fn processCsiParam(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) 
     }
 }
 
-fn processOscString(self: *VtParser, byte: u8) void {
+fn processOscString(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void {
     switch (byte) {
         0x1b => self.state = .osc_string_escape,
         0x07 => {
             // BEL terminates OSC (ST)
-            self.dispatchOsc();
+            self.dispatchOsc(s);
             self.state = .ground;
         },
         else => {
@@ -274,10 +321,10 @@ fn processOscString(self: *VtParser, byte: u8) void {
     }
 }
 
-fn processOscStringEscape(self: *VtParser, byte: u8) void {
+fn processOscStringEscape(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void {
     if (byte == '\\') {
         // ESC \ = ST (String Terminator)
-        self.dispatchOsc();
+        self.dispatchOsc(s);
     } else {
         // Not a valid ST — discard accumulated content
         self.osc_len = 0;
@@ -326,7 +373,7 @@ fn dispatchDcsApc(self: *VtParser) void {
     }
 }
 
-fn dispatchOsc(self: *VtParser) void {
+fn dispatchOsc(self: *VtParser, s: *SessionManager.DaemonSession) void {
     const content = self.osc_buf[0..self.osc_len];
     defer self.osc_len = 0;
 
@@ -341,8 +388,35 @@ fn dispatchOsc(self: *VtParser) void {
                 cb(clipboard_data);
             }
         }
+        return;
     }
-    // Other OSC types (0, 1, 2 for title) — ignored for now
+
+    // OSC 0 — set icon name + window title
+    if (content[0] == '0' and content[1] == ';') {
+        updateSessionTitle(s, content[2..]);
+        return;
+    }
+
+    // OSC 1 — set icon name (treat as title)
+    if (content[0] == '1' and content[1] == ';') {
+        updateSessionTitle(s, content[2..]);
+        return;
+    }
+
+    // OSC 2 — set window title
+    if (content[0] == '2' and content[1] == ';') {
+        updateSessionTitle(s, content[2..]);
+        return;
+    }
+}
+
+/// Update the session's title from an OSC sequence. Allocates a new
+/// copy; on allocation failure the title is left unchanged.
+fn updateSessionTitle(s: *SessionManager.DaemonSession, new_title: []const u8) void {
+    if (std.mem.eql(u8, s.title, new_title)) return;
+    const copy = s.alloc.dupe(u8, new_title) catch return;
+    s.alloc.free(s.title);
+    s.title = copy;
 }
 
 // ── CSI dispatch ──
@@ -468,19 +542,19 @@ fn dispatchDecPrivate(self: *VtParser, s: *SessionManager.DaemonSession, final: 
 
 // ── Character output ──
 
-fn putChar(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) void {
+fn putChar(self: *VtParser, s: *SessionManager.DaemonSession, codepoint: u32) void {
     if (s.cursor_x >= s.cols) {
         // Auto-wrap
         s.cursor_x = 0;
         self.linefeed(s);
     }
 
-    const cell = self.makeCell(byte);
+    const cell = self.makeCell(codepoint);
     s.setCell(s.cursor_x, s.cursor_y, cell);
     s.cursor_x += 1;
 }
 
-fn makeCell(self: *const VtParser, codepoint: u8) Protocol.WireCell {
+fn makeCell(self: *const VtParser, codepoint: u32) Protocol.WireCell {
     var flags: u8 = 0;
     if (self.bold) flags |= 0x01;
     if (self.italic) flags |= 0x02;
@@ -504,7 +578,7 @@ fn makeCell(self: *const VtParser, codepoint: u8) Protocol.WireCell {
 }
 
 fn blankCell(self: *const VtParser) Protocol.WireCell {
-    return self.makeCell(' ');
+    return self.makeCell(@as(u32, ' '));
 }
 
 // ── Line operations ──
@@ -858,6 +932,36 @@ fn resetState(self: *VtParser, s: *SessionManager.DaemonSession) void {
     }
 }
 
+/// Decode a UTF-8 byte sequence into a Unicode codepoint.
+/// Returns U+FFFD (replacement character) for invalid sequences.
+fn decodeUtf8(bytes: []const u8) u32 {
+    switch (bytes.len) {
+        2 => {
+            const cp = (@as(u32, bytes[0] & 0x1F) << 6) |
+                @as(u32, bytes[1] & 0x3F);
+            if (cp < 0x80) return 0xFFFD; // overlong
+            return cp;
+        },
+        3 => {
+            const cp = (@as(u32, bytes[0] & 0x0F) << 12) |
+                (@as(u32, bytes[1] & 0x3F) << 6) |
+                @as(u32, bytes[2] & 0x3F);
+            if (cp < 0x800) return 0xFFFD; // overlong
+            if (cp >= 0xD800 and cp <= 0xDFFF) return 0xFFFD; // surrogate
+            return cp;
+        },
+        4 => {
+            const cp = (@as(u32, bytes[0] & 0x07) << 18) |
+                (@as(u32, bytes[1] & 0x3F) << 12) |
+                (@as(u32, bytes[2] & 0x3F) << 6) |
+                @as(u32, bytes[3] & 0x3F);
+            if (cp < 0x10000 or cp > 0x10FFFF) return 0xFFFD;
+            return cp;
+        },
+        else => return 0xFFFD,
+    }
+}
+
 /// Convert a 256-color index to RGB.
 fn color256(idx: u16) Color {
     if (idx < 16) return ansi_colors[idx];
@@ -1097,4 +1201,135 @@ test "Sixel DCS sequence captured" {
     parser.feed(s, "\x1bPq#0;2;0;0;0~-\x1b\\");
 
     try std.testing.expectEqual(Protocol.ImageType.sixel, Ctx.cb_type.?);
+}
+
+test "UTF-8 2-byte character (é)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // é = U+00E9 = 0xC3 0xA9
+    parser.feed(s, "\xc3\xa9");
+
+    try std.testing.expectEqual(@as(u32, 0xE9), s.getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u16, 1), s.cursor_x);
+}
+
+test "UTF-8 3-byte character (中)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // 中 = U+4E2D = 0xE4 0xB8 0xAD
+    parser.feed(s, "\xe4\xb8\xad");
+
+    try std.testing.expectEqual(@as(u32, 0x4E2D), s.getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u16, 1), s.cursor_x);
+}
+
+test "UTF-8 4-byte character (emoji 😀)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // 😀 = U+1F600 = 0xF0 0x9F 0x98 0x80
+    parser.feed(s, "\xf0\x9f\x98\x80");
+
+    try std.testing.expectEqual(@as(u32, 0x1F600), s.getCell(0, 0).codepoint);
+}
+
+test "UTF-8 mixed with ASCII" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // "Aé" — ASCII A then UTF-8 é
+    parser.feed(s, "A\xc3\xa9B");
+
+    try std.testing.expectEqual(@as(u32, 'A'), s.getCell(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u32, 0xE9), s.getCell(1, 0).codepoint);
+    try std.testing.expectEqual(@as(u32, 'B'), s.getCell(2, 0).codepoint);
+}
+
+test "UTF-8 invalid continuation replaced" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // 0xC3 followed by non-continuation byte 'X'
+    parser.feed(s, "\xc3X");
+
+    // The invalid sequence is discarded, then 'X' is processed as ASCII
+    try std.testing.expectEqual(@as(u32, 'X'), s.getCell(0, 0).codepoint);
+}
+
+test "decodeUtf8 helper" {
+    // 2-byte: é = U+00E9
+    try std.testing.expectEqual(@as(u32, 0xE9), decodeUtf8(&[_]u8{ 0xC3, 0xA9 }));
+    // 3-byte: 中 = U+4E2D
+    try std.testing.expectEqual(@as(u32, 0x4E2D), decodeUtf8(&[_]u8{ 0xE4, 0xB8, 0xAD }));
+    // 4-byte: 😀 = U+1F600
+    try std.testing.expectEqual(@as(u32, 0x1F600), decodeUtf8(&[_]u8{ 0xF0, 0x9F, 0x98, 0x80 }));
+    // Overlong 2-byte → replacement
+    try std.testing.expectEqual(@as(u32, 0xFFFD), decodeUtf8(&[_]u8{ 0xC0, 0x80 }));
+    // Invalid length → replacement
+    try std.testing.expectEqual(@as(u32, 0xFFFD), decodeUtf8(&[_]u8{0x80}));
+}
+
+test "OSC 0 sets session title (BEL terminator)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // OSC 0;my title BEL
+    parser.feed(s, "\x1b]0;my title\x07");
+
+    try std.testing.expectEqualStrings("my title", s.title);
+}
+
+test "OSC 2 sets session title (ST terminator)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // OSC 2;zsh ESC backslash (ST)
+    parser.feed(s, "\x1b]2;zsh\x1b\\");
+
+    try std.testing.expectEqualStrings("zsh", s.title);
+}
+
+test "OSC title updates replace previous" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    parser.feed(s, "\x1b]0;first\x07");
+    try std.testing.expectEqualStrings("first", s.title);
+
+    parser.feed(s, "\x1b]2;second\x07");
+    try std.testing.expectEqualStrings("second", s.title);
 }

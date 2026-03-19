@@ -20,6 +20,8 @@ const crash_report = @import("crash_report.zig");
 const show_face = @import("show_face.zig");
 const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
+const daemon_cmd = @import("daemon.zig");
+const session_cmd = @import("session.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -72,6 +74,12 @@ pub const Action = enum {
 
     // Use IPC to tell the running Ghostty to open a new window.
     @"new-window",
+
+    /// Ensure the ghostty-daemon is running in the background
+    daemon,
+
+    /// Manage daemon sessions (list, create, attach, destroy)
+    session,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -152,6 +160,8 @@ pub const Action = enum {
             .@"show-face" => try show_face.run(alloc),
             .boo => try boo.run(alloc),
             .@"new-window" => try new_window.run(alloc),
+            .daemon => try daemon_cmd.run(alloc),
+            .session => try session_cmd.run(alloc),
         };
     }
 

@@ -6,7 +6,7 @@
 //!   ghostty-daemon [options]
 //!
 //! Options:
-//!   --listen <addr>      Listen address (default: unix:/tmp/ghostty-daemon.sock)
+//!   --listen <addr>      Listen address (default: unix:/tmp/ghostty.sock)
 //!   --auth-key <key>     Pre-shared authentication key (default: none)
 //!   --help               Show this help
 
@@ -62,7 +62,7 @@ pub fn main() !void {
 }
 
 fn parseArgs() !Config {
-    var listen_addr: []const u8 = "unix:/tmp/ghostty-daemon.sock";
+    var listen_addr: []const u8 = "unix:/tmp/ghostty.sock";
     var auth_key: []const u8 = "";
 
     var args = std.process.args();
@@ -90,7 +90,7 @@ fn parseArgs() !Config {
                 \\  ghostty-daemon [options]
                 \\
                 \\Options:
-                \\  --listen <addr>      Listen address (default: unix:/tmp/ghostty-daemon.sock)
+                \\  --listen <addr>      Listen address (default: unix:/tmp/ghostty.sock)
                 \\                       Formats: unix:/path/to/sock, tcp:host:port
                 \\  --auth-key <key>     Pre-shared authentication key (default: none)
                 \\  --help               Show this help
@@ -109,7 +109,7 @@ fn parseArgs() !Config {
     };
 }
 
-fn runUnixListener(
+pub fn runUnixListener(
     alloc: Allocator,
     path: []const u8,
     session_mgr: *SessionManager,
@@ -248,10 +248,10 @@ test "parseArgs defaults" {
     // Can't easily test arg parsing without mocking process.args,
     // but we verify the default config values.
     const config: Config = .{
-        .listen_addr = "unix:/tmp/ghostty-daemon.sock",
+        .listen_addr = "unix:/tmp/ghostty.sock",
         .auth_key = "",
     };
-    try std.testing.expectEqualStrings("unix:/tmp/ghostty-daemon.sock", config.listen_addr);
+    try std.testing.expectEqualStrings("unix:/tmp/ghostty.sock", config.listen_addr);
     try std.testing.expectEqualStrings("", config.auth_key);
 }
 

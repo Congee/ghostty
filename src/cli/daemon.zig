@@ -60,7 +60,7 @@ pub fn run(alloc: Allocator) !u8 {
 }
 
 pub fn getSocketPath() []const u8 {
-    return std.posix.getenv("GHOSTTY_DAEMON_SOCKET") orelse default_socket;
+    return std.posix.getenv("GHOSTTY_SOCKET") orelse default_socket;
 }
 
 pub fn isDaemonRunning(alloc: Allocator, socket_path: []const u8) bool {

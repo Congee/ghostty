@@ -2692,18 +2692,30 @@ pub fn refreshStatusBar(self: *Surface) !void {
     // ── Phase 2: Budget remaining space for external components ──
     const remaining: u16 = if (cols > tab_width) cols - tab_width else 0;
 
-    // Gather left and right components with their widths
+    // Deep-clone the status bar under lock to avoid use-after-free
+    // (another thread may call setComponents/clearComponents concurrently).
     self.renderer_state.mutex.lock();
-    const sb = self.renderer_state.status_bar;
+    const sb = if (self.renderer_state.status_bar) |*s|
+        s.clone(self.alloc) catch null
+    else
+        null;
     self.renderer_state.mutex.unlock();
+    defer if (sb) |s| s.deinit(self.alloc);
 
-    // Calculate which components fit by priority (descending).
-    // We include components greedily: highest priority first, skip if no space.
-    var left_budget: u16 = remaining / 2; // half for left
-    const right_budget: u16 = remaining - left_budget; // rest for right
+    // Components are rendered by priority (descending): highest priority first,
+    // lowest-priority components dropped when space is tight.
+    var left_budget: u16 = remaining / 2;
+    const right_budget: u16 = remaining - left_budget;
 
-    // ── Phase 3: Write left components (high priority first, skip if no space) ──
+    // ── Phase 3: Write left components (sorted by priority descending) ──
     if (sb) |s| {
+        // Sort by priority descending (cloned, so mutable)
+        const left_mut: []rendererpkg.State.Component = @constCast(s.left_components);
+        std.mem.sort(rendererpkg.State.Component, left_mut, {}, struct {
+            fn cmp(_: void, a: rendererpkg.State.Component, b: rendererpkg.State.Component) bool {
+                return a.priority > b.priority;
+            }
+        }.cmp);
         for (s.left_components) |comp| {
             const comp_width: u16 = @intCast(comp.text.len);
             if (comp_width > left_budget) continue; // drop — no space
@@ -2755,10 +2767,15 @@ pub fn refreshStatusBar(self: *Surface) !void {
         });
     }
 
-    // ── Phase 5: Write right components (right-aligned, skip if no space) ──
+    // ── Phase 5: Write right components (right-aligned, sorted by priority) ──
     if (sb) |s| {
         if (s.right_components.len > 0) {
-            // Calculate total width of components that fit
+            const right_mut: []rendererpkg.State.Component = @constCast(s.right_components);
+            std.mem.sort(rendererpkg.State.Component, right_mut, {}, struct {
+                fn cmp(_: void, a: rendererpkg.State.Component, b: rendererpkg.State.Component) bool {
+                    return a.priority > b.priority;
+                }
+            }.cmp);
             var total_right: u16 = 0;
             for (s.right_components) |comp| {
                 const cw: u16 = @intCast(comp.text.len);
@@ -2799,7 +2816,9 @@ pub fn refreshStatusBar(self: *Surface) !void {
         }
     }
 
-    // Restore cursor + attributes
+    // Restore scroll region to full screen (DECSTBM is NOT saved by DECSC,
+    // so we must explicitly reset it before restoring cursor).
+    try w.writeAll("\x1b[r"); // Reset DECSTBM to full screen
     try w.writeAll("\x1b[0m"); // Reset attributes
     try w.writeAll("\x1b8"); // DECRC
 

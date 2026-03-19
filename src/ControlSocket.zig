@@ -156,15 +156,21 @@ fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
         self.click_mutex.lock();
         defer self.click_mutex.unlock();
 
-        const key = self.alloc.dupe(u8, source) catch {
-            _ = posix.write(conn, "ERR alloc failed\n") catch {};
-            return false;
-        };
-        self.click_subscribers.put(key, conn) catch {
-            self.alloc.free(key);
-            _ = posix.write(conn, "ERR alloc failed\n") catch {};
-            return false;
-        };
+        // If source already subscribed, close old fd before replacing
+        if (self.click_subscribers.getEntry(source)) |entry| {
+            posix.close(entry.value_ptr.*);
+            entry.value_ptr.* = conn;
+        } else {
+            const key = self.alloc.dupe(u8, source) catch {
+                _ = posix.write(conn, "ERR alloc failed\n") catch {};
+                return false;
+            };
+            self.click_subscribers.put(key, conn) catch {
+                self.alloc.free(key);
+                _ = posix.write(conn, "ERR alloc failed\n") catch {};
+                return false;
+            };
+        }
         _ = posix.write(conn, "OK subscribed\n") catch {};
         log.info("click subscriber registered: {s} fd={}", .{ source, conn });
         return true; // Keep connection open
@@ -394,11 +400,15 @@ fn parseOneComponent(alloc: Allocator, val: std.json.Value) !Component {
 
         const action: Component.ClickAction.Action = if (std.mem.eql(u8, action_str, "notify"))
             .notify
-        else if (std.mem.startsWith(u8, action_str, "key:"))
-            .{ .key = try alloc.dupe(u8, action_str["key:".len..]) }
-        else if (std.mem.startsWith(u8, action_str, "cmd:"))
-            .{ .cmd = try alloc.dupe(u8, action_str["cmd:".len..]) }
-        else
+        else if (std.mem.startsWith(u8, action_str, "key:")) blk: {
+            const k = try alloc.dupe(u8, action_str["key:".len..]);
+            errdefer alloc.free(k);
+            break :blk .{ .key = k };
+        } else if (std.mem.startsWith(u8, action_str, "cmd:")) blk: {
+            const c = try alloc.dupe(u8, action_str["cmd:".len..]);
+            errdefer alloc.free(c);
+            break :blk .{ .cmd = c };
+        } else
             .notify;
 
         click = .{ .id = id, .action = action };

@@ -2670,6 +2670,11 @@ pub fn refreshStatusBar(self: *Surface) !void {
     try w.writeAll("\x1b[7m"); // Reverse video for status bar background
     try w.writeAll("\x1b[K"); // Clear line
 
+    // Build click regions while writing components
+    var click_regions = std.ArrayList(rendererpkg.State.ClickRegion).init(self.alloc);
+    defer click_regions.deinit();
+    var col_pos: u16 = 0;
+
     // Write left components
     {
         self.renderer_state.mutex.lock();
@@ -2677,7 +2682,18 @@ pub fn refreshStatusBar(self: *Surface) !void {
 
         if (self.renderer_state.status_bar) |sb| {
             for (sb.left_components) |comp| {
+                const start = col_pos;
                 try writeComponentEsc(w, comp);
+                col_pos += @intCast(comp.text.len);
+                if (comp.click) |cl| {
+                    try click_regions.append(.{
+                        .x_start = start,
+                        .x_end = col_pos,
+                        .click_id = cl.id,
+                        .source_id = sb.left_source,
+                        .action = cl.action,
+                    });
+                }
             }
         }
     }
@@ -2693,10 +2709,32 @@ pub fn refreshStatusBar(self: *Surface) !void {
         if (is_active) {
             try w.writeAll("\x1b[1m"); // Bold for active tab
         }
+
+        // Tab format: " idx:label" or " idx:label*"
+        const tab_start = col_pos;
         try w.print(" {d}:{s}", .{ i, label });
+        col_pos += 1; // space
+        // Count digits in index
+        var idx_val = i;
+        var idx_digits: u16 = 1;
+        while (idx_val >= 10) : (idx_val /= 10) idx_digits += 1;
+        col_pos += idx_digits + 1; // digits + ':'
+        col_pos += @intCast(label.len);
+
         if (is_active) {
-            try w.writeAll("*\x1b[22m"); // Unbold
+            try w.writeAll("*\x1b[22m");
+            col_pos += 1; // '*'
         }
+
+        // Tab click region — uses goto_tab action
+        try click_regions.append(.{
+            .x_start = tab_start,
+            .x_end = col_pos,
+            .click_id = "",
+            .source_id = "",
+            .action = .{ .key = "" }, // handled specially in click dispatch
+        });
+        // tab_start used above in click_regions.append
     }
 
     // Write right components (right-aligned)
@@ -2706,19 +2744,39 @@ pub fn refreshStatusBar(self: *Surface) !void {
 
         if (self.renderer_state.status_bar) |sb| {
             if (sb.right_components.len > 0) {
-                // Calculate total width of right components
-                var right_width: usize = 0;
+                var right_width: u16 = 0;
                 for (sb.right_components) |comp| {
-                    right_width += comp.text.len;
+                    right_width += @intCast(comp.text.len);
                 }
-                // Position cursor for right-aligned content
                 if (right_width < cols) {
-                    try w.print("\x1b[{d};{d}H", .{ status_row, cols - right_width + 1 });
+                    col_pos = cols - right_width;
+                    try w.print("\x1b[{d};{d}H", .{ status_row, col_pos + 1 });
                 }
                 for (sb.right_components) |comp| {
+                    const start = col_pos;
                     try writeComponentEsc(w, comp);
+                    col_pos += @intCast(comp.text.len);
+                    if (comp.click) |cl| {
+                        try click_regions.append(.{
+                            .x_start = start,
+                            .x_end = col_pos,
+                            .click_id = cl.id,
+                            .source_id = sb.right_source,
+                            .action = cl.action,
+                        });
+                    }
                 }
             }
+        }
+    }
+
+    // Store click regions in status bar state
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        if (self.renderer_state.status_bar) |*sb| {
+            if (sb.click_regions.len > 0) self.alloc.free(sb.click_regions);
+            sb.click_regions = try click_regions.toOwnedSlice();
         }
     }
 
@@ -4144,40 +4202,45 @@ pub fn mouseButtonCallback(
 
         const pos = try self.rt_surface.getCursorPos();
 
-        // Check if the click is in the status bar area (below the grid).
-        // If so, determine which tab was clicked and switch to it.
+        // Check if the click is on the status bar row (last row of the grid).
         if (self.config.status_bar_enabled) status_bar_click: {
             const grid_rows = t.screens.active.pages.rows;
-            const grid_bottom: f64 = @as(f64, @floatFromInt(self.size.padding.top)) +
-                @as(f64, @floatFromInt(grid_rows)) *
-                @as(f64, @floatFromInt(self.size.cell.height));
+            const pt_vp = self.posToViewport(pos.x, pos.y);
+            if (pt_vp.y != grid_rows - 1) break :status_bar_click;
 
-            if (pos.y >= grid_bottom) {
-                // Click is in the status bar. Map x position to a tab index
-                // by computing which character column was clicked and matching
-                // against the rendered status bar tab segments.
-                const click_col: usize = col: {
-                    const x_in_bar = pos.x - @as(f64, @floatFromInt(self.size.padding.left));
-                    if (x_in_bar < 0) break :status_bar_click;
-                    break :col @intFromFloat(x_in_bar / @as(f64, @floatFromInt(self.size.cell.width)));
-                };
+            const click_col: usize = pt_vp.x;
 
-                // Parse the status bar left text to find tab boundaries.
-                // Format: " [0:name*] 1:name 2:name"
-                // Each tab segment has a known start/end column.
-                if (self.renderer_state.status_bar) |sb| {
-                    const tab_index = self.findTabAtColumn(sb.left, click_col);
-                    if (tab_index) |idx| {
-                        _ = self.rt_app.performAction(
-                            .{ .surface = self },
-                            .goto_tab,
-                            @as(apprt.action.GotoTab, @enumFromInt(@as(c_int, @intCast(idx + 1)))),
-                        ) catch {};
+            // Check component click regions first
+            if (self.renderer_state.status_bar) |sb| {
+                for (sb.click_regions) |region| {
+                    if (click_col >= region.x_start and click_col < region.x_end) {
+                        switch (region.action) {
+                            .notify => {
+                                // TODO: push CLICK event to subscribed socket
+                            },
+                            .key => |_| {
+                                // TODO: execute keybind action
+                            },
+                            .cmd => |_| {
+                                // TODO: spawn subprocess
+                            },
+                        }
                         return true;
                     }
                 }
-                break :status_bar_click;
+
+                // Fall back to tab click detection
+                const tab_index = self.findTabAtColumn(sb.left, click_col);
+                if (tab_index) |idx| {
+                    _ = self.rt_app.performAction(
+                        .{ .surface = self },
+                        .goto_tab,
+                        @as(apprt.action.GotoTab, @enumFromInt(@as(c_int, @intCast(idx + 1)))),
+                    ) catch {};
+                    return true;
+                }
             }
+            break :status_bar_click;
         }
 
         const pin = pin: {

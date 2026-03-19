@@ -368,9 +368,13 @@ fn parseComponents(alloc: Allocator, json: []const u8) !ParsedComponents {
         initialized += 1;
     }
 
+    const zone_dup = try alloc.dupe(u8, zone);
+    errdefer alloc.free(zone_dup);
+    const source_dup = try alloc.dupe(u8, source);
+
     return .{
-        .zone = try alloc.dupe(u8, zone),
-        .source = try alloc.dupe(u8, source),
+        .zone = zone_dup,
+        .source = source_dup,
         .items = items,
     };
 }

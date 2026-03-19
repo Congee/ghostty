@@ -195,6 +195,14 @@ pub fn setName(self: *Session, new_name: []const u8) !void {
     self.name = try self.alloc.dupe(u8, new_name);
 }
 
+/// Return the best display label for this session: user-assigned name,
+/// then OSC title, then "shell" as fallback.
+pub fn displayLabel(self: *const Session) []const u8 {
+    if (self.name) |n| return n;
+    if (self.title) |t| return t;
+    return "shell";
+}
+
 /// Metadata about a session, suitable for display in a session picker.
 pub const SessionInfo = struct {
     id: u32,

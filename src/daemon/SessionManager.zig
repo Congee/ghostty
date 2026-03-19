@@ -61,10 +61,10 @@ pub const DaemonSession = struct {
     cursor_y: u16 = 0,
     cursor_visible: bool = true,
 
-    /// Alternate screen buffer (for vim, less, etc.)
+    /// Alternate screen buffer (for vim, less, etc.). When on the alt
+    /// screen, `cells` points to the alt buffer and `alt_cells` holds
+    /// the saved main buffer (pointer-swapped, no memcpy).
     alt_cells: ?[]Protocol.WireCell = null,
-    /// Saved main screen state (cells + cursor) when switched to alt screen.
-    saved_main_cells: ?[]Protocol.WireCell = null,
     saved_main_cursor_x: u16 = 0,
     saved_main_cursor_y: u16 = 0,
     /// True when the alternate screen is active.
@@ -110,28 +110,31 @@ pub const DaemonSession = struct {
         self.alloc.free(self.command);
         self.alloc.free(self.cells);
         if (self.alt_cells) |ac| self.alloc.free(ac);
-        if (self.saved_main_cells) |mc| self.alloc.free(mc);
         self.dirty_rows.deinit();
         for (self.scrollback.items) |row| self.alloc.free(row);
         self.scrollback.deinit(self.alloc);
     }
 
-    /// Switch to alternate screen buffer (mode 1049).
+    /// Switch to alternate screen buffer (mode 1049). Pointer-swaps
+    /// cells <-> alt_cells so the main screen is preserved without memcpy.
     pub fn switchToAltScreen(self: *DaemonSession) void {
         if (self.alt_screen_active) return;
 
         const cell_count = @as(usize, self.rows) * @as(usize, self.cols);
 
-        // Save current (main) screen
-        if (self.saved_main_cells == null) {
-            self.saved_main_cells = self.alloc.alloc(Protocol.WireCell, cell_count) catch return;
+        // Allocate alt buffer if needed
+        if (self.alt_cells == null) {
+            self.alt_cells = self.alloc.alloc(Protocol.WireCell, cell_count) catch return;
         }
-        @memcpy(self.saved_main_cells.?, self.cells[0..cell_count]);
+        // Clear the alt buffer
+        @memset(self.alt_cells.?, Protocol.WireCell{});
+
+        // Save cursor and swap buffers
         self.saved_main_cursor_x = self.cursor_x;
         self.saved_main_cursor_y = self.cursor_y;
-
-        // Clear the screen for alt buffer
-        @memset(self.cells, Protocol.WireCell{});
+        const tmp = self.cells;
+        self.cells = self.alt_cells.?;
+        self.alt_cells = tmp;
         self.cursor_x = 0;
         self.cursor_y = 0;
         self.alt_screen_active = true;
@@ -139,16 +142,14 @@ pub const DaemonSession = struct {
     }
 
     /// Switch back to main screen buffer (mode 1049 reset).
+    /// Pointer-swaps back so no memcpy needed.
     pub fn switchToMainScreen(self: *DaemonSession) void {
         if (!self.alt_screen_active) return;
 
-        const cell_count = @as(usize, self.rows) * @as(usize, self.cols);
-
-        // Restore main screen
-        if (self.saved_main_cells) |saved| {
-            const copy_len = @min(saved.len, cell_count);
-            @memcpy(self.cells[0..copy_len], saved[0..copy_len]);
-        }
+        // Swap back: cells (currently alt) <-> alt_cells (currently main)
+        const tmp = self.cells;
+        self.cells = self.alt_cells.?;
+        self.alt_cells = tmp;
         self.cursor_x = self.saved_main_cursor_x;
         self.cursor_y = self.saved_main_cursor_y;
         self.alt_screen_active = false;

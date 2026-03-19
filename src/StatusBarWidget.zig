@@ -87,9 +87,7 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
 
     if (std.mem.eql(u8, tag, "session")) {
         if (ctx.session) |s| {
-            const info = s.getInfo();
-            const label = info.name orelse info.title orelse "?";
-            try out.appendSlice(label);
+            try out.appendSlice(s.displayLabel());
         }
         return;
     }
@@ -134,17 +132,17 @@ fn expandTag(self: *const StatusBarWidget, out: *std.ArrayList(u8), tag: []const
 
     if (std.mem.eql(u8, tag, "tabs")) {
         if (ctx.tabs.len == 0) return;
-        for (ctx.tabs) |tab| {
-            try out.appendSlice(if (tab.is_active) "[" else " ");
-            // Format: index:label
+        for (ctx.tabs, 0..) |tab, i| {
+            if (i > 0) try out.append(' ');
+            // Format: [index:label] for active, [index:label] for all
+            try out.append('[');
             var idx_buf: [10]u8 = undefined;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{tab.index}) catch return;
             try out.appendSlice(idx_str);
             try out.append(':');
             try out.appendSlice(tab.label);
-            if (tab.is_active) {
-                try out.appendSlice("*]");
-            }
+            if (tab.is_active) try out.append('*');
+            try out.append(']');
         }
         return;
     }

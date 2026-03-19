@@ -2587,12 +2587,7 @@ pub fn refreshStatusBar(self: *Surface) !void {
 
     for (surfaces, 0..) |surf, i| {
         const core_surface: *Surface = &surf.core_surface;
-        const label = if (core_surface.session.name) |n|
-            @as([]const u8, n)
-        else if (core_surface.session.title) |t|
-            @as([]const u8, t)
-        else
-            "shell";
+        const label = core_surface.session.displayLabel();
         tab_infos[i] = .{
             .index = @intCast(i),
             .label = label,
@@ -5088,38 +5083,37 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
 /// Find which tab index corresponds to a column position in the status bar.
 /// Returns null if the column doesn't fall within any tab segment.
-/// Parses the status bar text format: " [0:name*] 1:name 2:name"
+/// Parses bracket-delimited format: "[0:zsh*] [1:vim] [2:htop]"
 fn findTabAtColumn(self: *const Surface, status_text: []const u8, col: usize) ?usize {
     _ = self;
-    // Walk through the text tracking column position and current tab index.
-    // Tab segments are identified by the pattern: digit followed by ':'
     var text_col: usize = 0;
     var i: usize = 0;
-    var current_tab: ?usize = null;
-    var tab_start_col: usize = 0;
 
-    while (i < status_text.len) : (i += 1) {
-        const c = status_text[i];
+    while (i < status_text.len) {
+        if (status_text[i] == '[') {
+            const bracket_start = text_col;
+            // Find the closing bracket
+            const close_pos = std.mem.indexOfScalarPos(u8, status_text, i + 1, ']') orelse break;
+            const bracket_end = bracket_start + (close_pos - i); // inclusive
 
-        // Detect start of a tab segment: a digit followed by ':'
-        if (c >= '0' and c <= '9' and i + 1 < status_text.len and status_text[i + 1] == ':') {
-            // If we had a previous tab and the click falls in its range, return it
-            if (current_tab != null and col >= tab_start_col and col < text_col) {
-                return current_tab;
-            }
-            current_tab = c - '0';
-            // Handle multi-digit tab indices
+            // Parse tab index from "idx:..."
+            var tab_idx: usize = 0;
             var j = i + 1;
-            while (j < status_text.len and status_text[j] >= '0' and status_text[j] <= '9') : (j += 1) {}
-            tab_start_col = text_col;
+            while (j < close_pos and status_text[j] >= '0' and status_text[j] <= '9') : (j += 1) {
+                tab_idx = tab_idx * 10 + (status_text[j] - '0');
+            }
+
+            // Check if click falls within this bracket range
+            if (col >= bracket_start and col <= bracket_end) {
+                return tab_idx;
+            }
+
+            text_col = bracket_end + 1;
+            i = close_pos + 1;
+        } else {
+            text_col += 1;
+            i += 1;
         }
-
-        text_col += 1;
-    }
-
-    // Check last tab segment
-    if (current_tab != null and col >= tab_start_col and col < text_col) {
-        return current_tab;
     }
 
     return null;

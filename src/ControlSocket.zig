@@ -203,6 +203,25 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
     return "ERR unknown command\n";
 }
 
+/// Write a JSON-escaped string (handles ", \, and control characters).
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                try std.fmt.format(w, "\\u{x:0>4}", .{ch});
+            },
+            else => try w.writeByte(ch),
+        }
+    }
+    try w.writeByte('"');
+}
+
 /// LIST-TABS: returns JSON array of tab info.
 /// Format: [{"index":0,"title":"zsh","active":true}, ...]
 fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
@@ -213,17 +232,14 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
 
     for (self.app.surfaces.items, 0..) |surf, i| {
         const core = &surf.core_surface;
-        const label = if (core.session.name) |n|
-            @as([]const u8, n)
-        else if (core.session.title) |t|
-            @as([]const u8, t)
-        else
-            "shell";
+        const label = core.session.displayLabel();
         const is_active = if (focused) |f| (core == f) else false;
 
         if (i > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
-        std.fmt.format(w, "{{\"index\":{d},\"title\":\"{s}\",\"active\":{s}}}", .{
-            i, label, if (is_active) "true" else "false",
+        std.fmt.format(w, "{{\"index\":{d},\"title\":", .{i}) catch return "ERR buffer overflow\n";
+        writeJsonString(w, label) catch return "ERR buffer overflow\n";
+        std.fmt.format(w, ",\"active\":{s}}}", .{
+            if (is_active) "true" else "false",
         }) catch return "ERR buffer overflow\n";
     }
 
@@ -247,11 +263,11 @@ fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     const info = surface.session.getInfo();
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
-    std.fmt.format(w, "{{\"index\":{d},\"id\":{d},\"name\":\"{s}\",\"title\":\"{s}\",\"tabs\":{d}}}\n", .{
-        idx,
-        info.id,
-        info.name orelse "",
-        info.title orelse "",
+    std.fmt.format(w, "{{\"index\":{d},\"id\":{d},\"name\":", .{ idx, info.id }) catch return "ERR buffer overflow\n";
+    writeJsonString(w, info.name orelse "") catch return "ERR buffer overflow\n";
+    w.writeAll(",\"title\":") catch return "ERR buffer overflow\n";
+    writeJsonString(w, info.title orelse "") catch return "ERR buffer overflow\n";
+    std.fmt.format(w, ",\"tabs\":{d}}}\n", .{
         self.app.surfaces.items.len,
     }) catch return "ERR buffer overflow\n";
     return fbs.getWritten();

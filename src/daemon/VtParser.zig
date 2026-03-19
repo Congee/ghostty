@@ -636,11 +636,8 @@ fn scrollUp(self: *VtParser, s: *SessionManager.DaemonSession) void {
     }
 
     // Blank the bottom line
-    const blank = self.blankCell();
     const bot_start = bot * cols;
-    for (0..cols) |col| {
-        s.cells[bot_start + col] = blank;
-    }
+    @memset(s.cells[bot_start..][0..cols], self.blankCell());
     s.dirty_rows.set(bot);
 }
 
@@ -662,11 +659,8 @@ fn scrollDown(self: *VtParser, s: *SessionManager.DaemonSession) void {
     }
 
     // Blank the top line
-    const blank = self.blankCell();
     const top_start = top * cols;
-    for (0..cols) |col| {
-        s.cells[top_start + col] = blank;
-    }
+    @memset(s.cells[top_start..][0..cols], self.blankCell());
     s.dirty_rows.set(top);
 }
 

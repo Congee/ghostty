@@ -32,6 +32,11 @@ socket_fd: ?posix.socket_t = null,
 listen_thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+/// Click subscribers: source_id → fd. When a component with action=notify
+/// is clicked, write CLICK <id> <button>\n to the subscribed fd.
+click_subscribers: std.StringHashMap(posix.fd_t),
+click_mutex: std.Thread.Mutex = .{},
+
 /// The app to query for sessions.
 app: *App,
 
@@ -55,6 +60,7 @@ pub fn init(
         .path = path,
         .app = app,
         .surface_fn = &getFocusedCoreSurface,
+        .click_subscribers = std.StringHashMap(posix.fd_t).init(alloc),
     };
 }
 
@@ -68,7 +74,17 @@ pub fn deinit(self: *ControlSocket) void {
         posix.close(fd);
         self.socket_fd = null;
     }
-    // Remove the socket file
+    // Close subscriber connections
+    {
+        self.click_mutex.lock();
+        defer self.click_mutex.unlock();
+        var it = self.click_subscribers.iterator();
+        while (it.next()) |entry| {
+            posix.close(entry.value_ptr.*);
+            self.alloc.free(entry.key_ptr.*);
+        }
+        self.click_subscribers.deinit();
+    }
     std.fs.cwd().deleteFile(self.path) catch {};
     self.alloc.free(self.path);
 }
@@ -115,30 +131,54 @@ fn acceptLoop(self: *ControlSocket) void {
             log.warn("accept error: {}", .{err});
             continue;
         };
-        defer posix.close(conn);
-        self.handleConnection(conn);
+        // handleConnection returns true if the connection should be kept
+        // open (e.g., SUBSCRIBE-CLICKS). Otherwise we close it.
+        if (!self.handleConnection(conn)) {
+            posix.close(conn);
+        }
     }
 }
 
-fn handleConnection(self: *ControlSocket, conn: posix.socket_t) void {
+/// Returns true if the connection should be kept open (subscriptions).
+fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
     var buf: [4096]u8 = undefined;
     const n = posix.read(conn, &buf) catch |err| {
         log.warn("read error: {}", .{err});
-        return;
+        return false;
     };
-    if (n == 0) return;
+    if (n == 0) return false;
 
     const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
 
-    // Commands that return dynamic content use the response buffer
+    // SUBSCRIBE-CLICKS: keep connection open for push notifications
+    if (std.mem.startsWith(u8, line, "SUBSCRIBE-CLICKS ")) {
+        const source = line["SUBSCRIBE-CLICKS ".len..];
+        self.click_mutex.lock();
+        defer self.click_mutex.unlock();
+
+        const key = self.alloc.dupe(u8, source) catch {
+            _ = posix.write(conn, "ERR alloc failed\n") catch {};
+            return false;
+        };
+        self.click_subscribers.put(key, conn) catch {
+            self.alloc.free(key);
+            _ = posix.write(conn, "ERR alloc failed\n") catch {};
+            return false;
+        };
+        _ = posix.write(conn, "OK subscribed\n") catch {};
+        log.info("click subscriber registered: {s} fd={}", .{ source, conn });
+        return true; // Keep connection open
+    }
+
     var resp_buf: [8192]u8 = undefined;
     const response = self.handleCommand(line, &resp_buf) catch |err| {
-        const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return;
+        const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return false;
         _ = posix.write(conn, msg) catch {};
-        return;
+        return false;
     };
 
     _ = posix.write(conn, response) catch {};
+    return false;
 }
 
 fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]const u8 {
@@ -379,4 +419,24 @@ fn parseHexColor(s: []const u8) ?[3]u8 {
 fn freeComponents(alloc: Allocator, items: []Component) void {
     for (items) |*c| c.deinit(alloc);
     alloc.free(items);
+}
+
+/// Dispatch a click event to the subscriber for the given source.
+/// Called from Surface when a component with action=notify is clicked.
+pub fn dispatchClick(self: *ControlSocket, source_id: []const u8, click_id: []const u8) void {
+    self.click_mutex.lock();
+    defer self.click_mutex.unlock();
+
+    const fd = self.click_subscribers.get(source_id) orelse return;
+
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "CLICK {s}\n", .{click_id}) catch return;
+    _ = posix.write(fd, msg) catch |err| {
+        // Subscriber disconnected — clean up
+        log.info("click subscriber disconnected: {s} err={}", .{ source_id, err });
+        if (self.click_subscribers.fetchRemove(source_id)) |kv| {
+            posix.close(kv.value);
+            self.alloc.free(kv.key);
+        }
+    };
 }

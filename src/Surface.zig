@@ -4216,7 +4216,9 @@ pub fn mouseButtonCallback(
                     if (click_col >= region.x_start and click_col < region.x_end) {
                         switch (region.action) {
                             .notify => {
-                                // TODO: push CLICK event to subscribed socket
+                                if (self.app.control_socket) |*sock| {
+                                    sock.dispatchClick(region.source_id, region.click_id);
+                                }
                             },
                             .key => |_| {
                                 // TODO: execute keybind action

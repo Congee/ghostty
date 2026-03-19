@@ -9,22 +9,42 @@ const assert = @import("quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const apprt = @import("apprt.zig");
 const Surface = @import("Surface.zig");
+const Session = @import("Session.zig");
 const input = @import("input.zig");
 const configpkg = @import("config.zig");
 const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
 const renderer = @import("renderer.zig");
+const rendererpkg = renderer;
+const termio = @import("termio.zig");
 const font = @import("font/main.zig");
+const ControlSocket = @import("ControlSocket.zig");
 
 const log = std.log.scoped(.app);
 
 const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
+const SessionList = std.ArrayListUnmanaged(*Session);
 
 /// General purpose allocator
 alloc: Allocator,
 
 /// The list of surfaces that are currently active.
 surfaces: SurfaceList,
+
+/// The list of sessions. Sessions persist independently of surfaces.
+/// A session remains in this list even when detached (no attached surface).
+sessions: SessionList,
+
+/// Counter for generating unique session IDs.
+next_session_id: u32 = 0,
+
+/// When true, the next Surface.init will attach to the most recent
+/// detached session instead of creating a new one. Set by the C API
+/// before surface creation and consumed by Surface.init.
+reattach_on_next_surface: bool = false,
+
+/// The control socket for external status bar updates and session queries.
+control_socket: ?ControlSocket = null,
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -96,16 +116,43 @@ pub fn init(
     self.* = .{
         .alloc = alloc,
         .surfaces = .{},
+        .sessions = .{},
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
     };
 }
 
+/// Start the control socket if not already running.
+pub fn ensureControlSocket(self: *App, socket_path: ?[]const u8) void {
+    if (self.control_socket != null) return;
+
+    var sock = ControlSocket.init(self.alloc, self, socket_path) catch |err| {
+        log.warn("failed to init control socket: {}", .{err});
+        return;
+    };
+    sock.start() catch |err| {
+        log.warn("failed to start control socket: {}", .{err});
+        sock.deinit();
+        return;
+    };
+    self.control_socket = sock;
+}
+
 pub fn deinit(self: *App) void {
+    // Stop the control socket
+    if (self.control_socket) |*sock| {
+        sock.deinit();
+        self.control_socket = null;
+    }
+
     // Clean up all our surfaces
     for (self.surfaces.items) |surface| surface.deinit();
     self.surfaces.deinit(self.alloc);
+
+    // Destroy any remaining sessions (detached or otherwise)
+    for (self.sessions.items) |session| session.destroy();
+    self.sessions.deinit(self.alloc);
 
     // Clean up our font group cache
     // We should have zero items in the grid set at this point because
@@ -205,9 +252,26 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         i += 1;
     }
 
-    // If we have no surfaces, we can start the quit timer. It is up to the
-    // apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0) _ = rt_surface.rtApp().performAction(
+    // Clean up dead detached sessions (child exited, no surface attached)
+    {
+        var j: usize = 0;
+        while (j < self.sessions.items.len) {
+            const s = self.sessions.items[j];
+            if (s.attached_surface == null and s.child_exited) {
+                s.destroy();
+                _ = self.sessions.swapRemove(j);
+                continue;
+            }
+            j += 1;
+        }
+    }
+
+    // Refresh status bars on remaining surfaces (tab count changed)
+    self.refreshAllStatusBars();
+
+    // If we have no surfaces AND no live sessions, we can start the
+    // quit timer. It is up to the apprt to determine if this is necessary.
+    if (self.surfaces.items.len == 0 and self.sessions.items.len == 0) _ = rt_surface.rtApp().performAction(
         .app,
         .quit_timer,
         .start,
@@ -530,6 +594,81 @@ fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
     }
 
     return false;
+}
+
+/// Create a new session and register it with the app.
+pub fn createSession(
+    self: *App,
+    alloc: Allocator,
+    io_thread: termio.Thread,
+    size: rendererpkg.Size,
+) !*Session {
+    const id = self.next_session_id;
+    self.next_session_id += 1;
+
+    const session = try Session.create(alloc, id, io_thread, size);
+    errdefer session.destroy();
+
+    try self.sessions.append(self.alloc, session);
+    log.info("session created id={}", .{id});
+    return session;
+}
+
+/// Destroy a session and remove it from the registry.
+pub fn destroySession(self: *App, session: *Session) void {
+    // Remove from the list
+    var i: usize = 0;
+    while (i < self.sessions.items.len) {
+        if (self.sessions.items[i] == session) {
+            _ = self.sessions.swapRemove(i);
+            break;
+        }
+        i += 1;
+    }
+
+    session.destroy();
+}
+
+/// Detach a session: keep it alive but mark it as having no attached surface.
+pub fn detachSession(self: *App, session: *Session) void {
+    _ = self;
+    session.detach();
+}
+
+/// Find the most recently created detached session (not attached, not exited).
+pub fn findDetachedSession(self: *App) ?*Session {
+    // Iterate backwards to find the most recent
+    var i: usize = self.sessions.items.len;
+    while (i > 0) {
+        i -= 1;
+        const s = self.sessions.items[i];
+        if (s.attached_surface == null and !s.child_exited) return s;
+    }
+    return null;
+}
+
+/// Log all sessions to the debug log. Useful for diagnostics.
+pub fn logSessions(self: *App) void {
+    log.info("sessions: {} total", .{self.sessions.items.len});
+    for (self.sessions.items) |s| {
+        const info = s.getInfo();
+        log.info("  session id={} name={s} title={s} cmd={s} attached={} exited={}", .{
+            info.id,
+            info.name orelse "(none)",
+            info.title orelse "(none)",
+            if (info.command) |c| std.mem.sliceTo(c, 0) else "(none)",
+            info.attached,
+            info.child_exited,
+        });
+    }
+}
+
+/// Refresh the status bar on all surfaces. Call this when the tab list
+/// changes (surface created/destroyed/renamed) so all status bars update.
+pub fn refreshAllStatusBars(self: *App) void {
+    for (self.surfaces.items) |surface| {
+        surface.core_surface.refreshStatusBar() catch {};
+    }
 }
 
 /// The message types that can be sent to the app thread.

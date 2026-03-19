@@ -33,6 +33,7 @@ const configpkg = @import("config.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
+const Session = @import("Session.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
@@ -116,10 +117,9 @@ pressed_key: ?input.KeyEvent = null,
 /// for handled bindings.
 last_binding_trigger: u64 = 0,
 
-/// The terminal IO handler.
-io: termio.Termio,
-io_thread: termio.Thread,
-io_thr: std.Thread,
+/// The session that owns the terminal IO, subprocess, and terminal state.
+/// This is heap-allocated and can outlive the surface for detach/reattach.
+session: *Session,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
@@ -138,9 +138,7 @@ config: DerivedConfig,
 /// is sent whenever this changes.
 config_conditional_state: configpkg.ConditionalState,
 
-/// This is set to true if our IO thread notifies us our child exited.
-/// This is used to determine if we need to confirm, hold open, etc.
-child_exited: bool = false,
+/// child_exited is tracked by the session. Access via self.session.child_exited.
 
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
@@ -326,6 +324,7 @@ const DerivedConfig = struct {
     window_padding_left: u32,
     window_padding_right: u32,
     window_padding_balance: configpkg.Config.WindowPaddingBalance,
+    status_bar_enabled: bool,
     window_height: u32,
     window_width: u32,
     title: ?[:0]const u8,
@@ -404,6 +403,7 @@ const DerivedConfig = struct {
             .window_padding_left = config.@"window-padding-x".top_left,
             .window_padding_right = config.@"window-padding-x".bottom_right,
             .window_padding_balance = config.@"window-padding-balance",
+            .status_bar_enabled = config.@"status-bar",
             .window_height = config.@"window-height",
             .window_width = config.@"window-width",
             .title = config.title,
@@ -574,9 +574,36 @@ pub fn init(
     );
     errdefer render_thread.deinit();
 
-    // Create the IO thread
-    var io_thread = try termio.Thread.init(alloc);
-    errdefer io_thread.deinit();
+    // Check if we should reattach to a detached session instead of
+    // creating a new one. This is set by the apprt (e.g., dock click
+    // on macOS) BEFORE creating the surface, so there's no race.
+    const reattach = if (app.reattach_on_next_surface) blk: {
+        app.reattach_on_next_surface = false;
+        break :blk app.findDetachedSession();
+    } else null;
+
+    const session = if (reattach) |existing| existing else new_session: {
+        // Create a session to own the IO state. The session is heap-allocated
+        // so that &session.io.terminal is a stable pointer.
+        const s = try app.createSession(alloc, try termio.Thread.init(alloc), size);
+        // If we fail after this point, we need to clean up the session.
+        // We can't call session.destroy() because the IO thread hasn't started yet
+        // (destroy() would try to join io_thr). So we do manual cleanup.
+        errdefer {
+            s.io_thread.deinit();
+            s.alloc.destroy(s);
+            // Remove from app's session list
+            var idx: usize = 0;
+            while (idx < app.sessions.items.len) {
+                if (app.sessions.items[idx] == s) {
+                    _ = app.sessions.swapRemove(idx);
+                    break;
+                }
+                idx += 1;
+            }
+        }
+        break :new_session s;
+    };
 
     self.* = .{
         .alloc = alloc,
@@ -591,14 +618,12 @@ pub fn init(
         .renderer_thread = render_thread,
         .renderer_state = .{
             .mutex = mutex,
-            .terminal = &self.io.terminal,
+            .terminal = &session.io.terminal,
         },
         .renderer_thr = undefined,
         .mouse = .{},
         .keyboard = .{},
-        .io = undefined,
-        .io_thread = io_thread,
-        .io_thr = undefined,
+        .session = session,
         .size = size,
         .config = derived_config,
 
@@ -607,112 +632,123 @@ pub fn init(
         .config_conditional_state = app.config_conditional_state,
     };
 
-    // The command we're going to execute
-    const command: ?configpkg.Command = command: {
-        if (app.first) {
-            if (config.@"initial-command") |command| {
-                break :command command;
-            }
+    if (reattach != null) {
+        // Reattach path: the session already has IO state (Termio, terminal,
+        // pty, subprocess). We just reconnect pointers and start threads.
+        try session.prepareReattach(self);
+
+        // Start renderer thread
+        self.renderer_thr = try std.Thread.spawn(
+            .{},
+            rendererpkg.Thread.threadMain,
+            .{&self.renderer_thread},
+        );
+        self.renderer_thr.setName("renderer") catch {};
+
+        // Start IO thread (renderer is ready)
+        try session.startReattachedIO();
+
+        // Restore title
+        if (session.title) |title| {
+            _ = try rt_app.performAction(
+                .{ .surface = self },
+                .set_title,
+                .{ .title = title },
+            );
         }
-        break :command config.command;
-    };
+    } else {
+        // New session path: initialize IO from scratch.
 
-    // Start our IO implementation
-    // This separate block ({}) is important because our errdefers must
-    // be scoped here to be valid.
-    {
-        var env = rt_surface.defaultTermioEnv() catch |err| env: {
-            // If an error occurs, we don't want to block surface startup.
-            log.warn("error getting env map for surface err={}", .{err});
-            break :env internal_os.getEnvMap(alloc) catch
-                std.process.EnvMap.init(alloc);
+        // Link the session back to this surface
+        session.attached_surface = self;
+
+        // The command we're going to execute
+        const command: ?configpkg.Command = command: {
+            if (app.first) {
+                if (config.@"initial-command") |command| {
+                    break :command command;
+                }
+            }
+            break :command config.command;
         };
-        errdefer env.deinit();
 
-        // don't leak GHOSTTY_LOG to any subprocesses
-        env.remove("GHOSTTY_LOG");
+        // Start our IO implementation
+        // This separate block ({}) is important because our errdefers must
+        // be scoped here to be valid.
+        {
+            var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                // If an error occurs, we don't want to block surface startup.
+                log.warn("error getting env map for surface err={}", .{err});
+                break :env internal_os.getEnvMap(alloc) catch
+                    std.process.EnvMap.init(alloc);
+            };
+            errdefer env.deinit();
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global_state.resources_dir.host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+            // don't leak GHOSTTY_LOG to any subprocesses
+            env.remove("GHOSTTY_LOG");
 
-        // Initialize our IO mailbox
-        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
-        errdefer io_mailbox.deinit(alloc);
+            // Export the control socket path if available
+            if (app.control_socket) |sock| {
+                try env.put("GHOSTTY_SOCKET", sock.path);
+            }
 
-        try termio.Termio.init(&self.io, alloc, .{
-            .size = size,
-            .full_config = config,
-            .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
-            .mailbox = io_mailbox,
-            .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
-            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
-        });
+            // Initialize our IO backend
+            var io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global_state.resources_dir.host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            errdefer io_exec.deinit();
+
+            // Initialize our IO mailbox
+            var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+            errdefer io_mailbox.deinit(alloc);
+
+            try termio.Termio.init(&self.session.io, alloc, .{
+                .size = size,
+                .full_config = config,
+                .config = try termio.Termio.DerivedConfig.init(alloc, config),
+                .backend = .{ .exec = io_exec },
+                .mailbox = io_mailbox,
+                .renderer_state = &self.renderer_state,
+                .renderer_wakeup = render_thread.wakeup,
+                .renderer_mailbox = render_thread.mailbox,
+                .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            });
+        }
+        // Outside the block, IO has now taken ownership of our temporary state
+        // so we can just defer this and not the subcomponents.
+        errdefer self.session.io.deinit();
+
+        // Start our renderer thread
+        self.renderer_thr = try std.Thread.spawn(
+            .{},
+            rendererpkg.Thread.threadMain,
+            .{&self.renderer_thread},
+        );
+        self.renderer_thr.setName("renderer") catch {};
+
+        // Start our IO thread
+        self.session.io_thr = try std.Thread.spawn(
+            .{},
+            termio.Thread.threadMain,
+            .{ &self.session.io_thread, &self.session.io },
+        );
+        self.session.io_thr.setName("io") catch {};
     }
-    // Outside the block, IO has now taken ownership of our temporary state
-    // so we can just defer this and not the subcomponents.
-    errdefer self.io.deinit();
 
-    // Report initial cell size on surface creation
-    _ = try rt_app.performAction(
-        .{ .surface = self },
-        .cell_size,
-        .{ .width = size.cell.width, .height = size.cell.height },
-    );
-
-    _ = try rt_app.performAction(
-        .{ .surface = self },
-        .size_limit,
-        .{
-            .min_width = size.cell.width * min_window_width_cells,
-            .min_height = size.cell.height * min_window_height_cells,
-            // No max:
-            .max_width = 0,
-            .max_height = 0,
-        },
-    );
-
-    // Call our size callback which handles all our retina setup
-    // Note: this shouldn't be necessary and when we clean up the surface
-    // init stuff we should get rid of this. But this is required because
-    // sizeCallback does retina-aware stuff we don't do here and don't want
-    // to duplicate.
-    try self.resize(self.size.screen);
-
-    // Give the renderer one more opportunity to finalize any surface
-    // setup on the main thread prior to spinning up the rendering thread.
-    try renderer_impl.finalizeSurfaceInit(rt_surface);
-
-    // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
-        .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
-    );
-    self.renderer_thr.setName("renderer") catch {};
-
-    // Start our IO thread
-    self.io_thr = try std.Thread.spawn(
-        .{},
-        termio.Thread.threadMain,
-        .{ &self.io_thread, &self.io },
-    );
-    self.io_thr.setName("io") catch {};
+    // Start the control socket if status bar is enabled.
+    if (config.@"status-bar") {
+        app.ensureControlSocket(config.@"control-socket");
+    }
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -725,6 +761,16 @@ pub fn init(
         // We don't treat this as a fatal error because not setting
         // an initial size shouldn't stop our terminal from working.
         log.warn("unable to set initial window size: {}", .{err});
+    };
+
+    // The command we're going to execute (used for title setting below)
+    const command: ?configpkg.Command = command: {
+        if (app.first) {
+            if (config.@"initial-command") |cmd| {
+                break :command cmd;
+            }
+        }
+        break :command config.command;
     };
 
     if (config.title) |title| {
@@ -772,6 +818,9 @@ pub fn init(
 
     // We are no longer the first surface
     app.first = false;
+
+    // Render initial status bar content (shows tab list)
+    self.refreshStatusBar() catch {};
 }
 
 pub fn deinit(self: *Surface) void {
@@ -788,19 +837,23 @@ pub fn deinit(self: *Surface) void {
         self.renderer.threadEnter(self.rt_surface) catch unreachable;
     }
 
-    // Stop our IO thread
-    {
-        self.io_thread.stop.notify() catch |err|
-            log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
-    }
-
-    // We need to deinit AFTER everything is stopped, since there are
+    // We need to deinit renderer AFTER the thread is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
     self.renderer.deinit();
-    self.io_thread.deinit();
-    self.io.deinit();
+
+    if (self.session.attached_surface == self) {
+        // Session is still attached to us: full destroy (stops IO thread,
+        // kills subprocess, frees everything, removes from app's session list).
+        self.app.destroySession(self.session);
+    } else {
+        // Session was detached (e.g. via detach_session). Stop the IO thread
+        // (it should be in park_mode so subprocess stays alive), but keep
+        // the session in the app's session list.
+        self.session.io_thread.stop.notify() catch |err|
+            log.err("error notifying io thread to stop for detach, may stall err={}", .{err});
+        self.session.io_thr.join();
+    }
 
     if (self.inspector) |v| {
         v.deinit(self.alloc);
@@ -822,6 +875,12 @@ pub fn deinit(self: *Surface) void {
 
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
+
+/// Swap this surface's session to a different (detached) session.
+/// Stops the current session's IO, destroys it, attaches the target
+/// session, and starts its IO thread. All done synchronously on the
+/// main thread — no new surfaces created, no timing races.
+
 
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
@@ -858,7 +917,7 @@ fn queueIo(
         }
     }
 
-    self.io.queueMessage(msg, mutex);
+    self.session.io.queueMessage(msg, mutex);
 }
 
 /// Forces the surface to render. This is useful for when the surface
@@ -927,7 +986,7 @@ pub fn needsConfirmQuit(self: *Surface) bool {
 
     // If the child has exited, then our process is certainly not alive.
     // We check this first to avoid the locking overhead below.
-    if (self.child_exited) return false;
+    if (self.session.child_exited) return false;
 
     // Check the configuration for confirming close behavior.
     return switch (self.config.confirm_close_surface) {
@@ -936,7 +995,7 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .true => true: {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            break :true !self.io.terminal.cursorIsAtPrompt();
+            break :true !self.session.io.terminal.cursorIsAtPrompt();
         },
     };
 }
@@ -958,6 +1017,11 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             // We know that our title should end in 0.
             const slice = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
             log.debug("changing title \"{s}\"", .{slice});
+
+            // Persist title on the session so it survives surface destruction.
+            self.session.setTitle(slice) catch |err|
+                log.warn("failed to persist title on session err={}", .{err});
+
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .set_title,
@@ -1202,7 +1266,7 @@ fn selectionScrollTick(self: *Surface) !void {
 
 fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
-    self.child_exited = true;
+    self.session.child_exited = true;
 
     // If our runtime was below some threshold then we assume that this
     // was an abnormal exit and we show an error message.
@@ -1290,7 +1354,7 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+    const command = try std.mem.join(alloc, " ", switch (self.session.io.backend) {
         .exec => |*exec| exec.subprocess.args,
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
@@ -1367,10 +1431,10 @@ fn passwordInput(self: *Surface, v: bool) !void {
 
         // If our password input state is unchanged then we don't
         // waste time doing anything more.
-        const old = self.io.terminal.flags.password_input;
+        const old = self.session.io.terminal.flags.password_input;
         if (old == v) return;
 
-        self.io.terminal.flags.password_input = v;
+        self.session.io.terminal.flags.password_input = v;
     }
 
     // Notify our apprt so it can do whatever it wants.
@@ -1571,7 +1635,7 @@ fn mouseRefreshLinks(
         const left_idx = @intFromEnum(input.MouseButton.left);
         if (self.mouse.click_state[left_idx] == .press) click: {
             const pin = self.mouse.left_click_pin orelse break :click;
-            const click_pt = self.io.terminal.screens.active.pages.pointFromPin(
+            const click_pt = self.session.io.terminal.screens.active.pages.pointFromPin(
                 .viewport,
                 pin.*,
             ) orelse break :click;
@@ -1585,7 +1649,7 @@ fn mouseRefreshLinks(
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
             .open => {
-                const str = try self.io.terminal.screens.active.selectionString(alloc, .{
+                const str = try self.session.io.terminal.screens.active.selectionString(alloc, .{
                     .sel = link.selection,
                     .trim = false,
                 });
@@ -1640,7 +1704,7 @@ fn mouseRefreshLinks(
         _ = try self.rt_app.performAction(
             .{ .surface = self },
             .mouse_shape,
-            self.io.terminal.mouse_shape,
+            self.session.io.terminal.mouse_shape,
         );
         _ = try self.rt_app.performAction(
             .{ .surface = self },
@@ -1899,7 +1963,7 @@ pub fn dumpTextLocked(
     sel: terminal.Selection,
 ) !Text {
     // Read out the text
-    const text = try self.io.terminal.screens.active.selectionString(alloc, .{
+    const text = try self.session.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -1909,19 +1973,19 @@ pub fn dumpTextLocked(
     const vp: ?Text.Viewport = viewport: {
         // If our bottom right pin is before the viewport, then we can't
         // possibly have this text be within the viewport.
-        const vp_tl_pin = self.io.terminal.screens.active.pages.getTopLeft(.viewport);
-        const br_pin = sel.bottomRight(self.io.terminal.screens.active);
+        const vp_tl_pin = self.session.io.terminal.screens.active.pages.getTopLeft(.viewport);
+        const br_pin = sel.bottomRight(self.session.io.terminal.screens.active);
         if (br_pin.before(vp_tl_pin)) break :viewport null;
 
         // If our top-left pin is after the viewport, then we can't possibly
         // have this text be within the viewport.
-        const vp_br_pin = self.io.terminal.screens.active.pages.getBottomRight(.viewport) orelse {
+        const vp_br_pin = self.session.io.terminal.screens.active.pages.getBottomRight(.viewport) orelse {
             // I don't think this is possible but I don't want to crash on
             // that assertion so let's just break out...
             log.warn("viewport bottom-right pin not found, bug?", .{});
             break :viewport null;
         };
-        const tl_pin = sel.topLeft(self.io.terminal.screens.active);
+        const tl_pin = sel.topLeft(self.session.io.terminal.screens.active);
         if (vp_br_pin.before(tl_pin)) break :viewport null;
 
         // We established that our top-left somewhere before the viewport
@@ -1931,7 +1995,7 @@ pub fn dumpTextLocked(
 
         // Our top-left point. If it doesn't exist in the viewport it must
         // be before and we can return (0,0).
-        const tl_pt: terminal.Point = self.io.terminal.screens.active.pages.pointFromPin(
+        const tl_pt: terminal.Point = self.session.io.terminal.screens.active.pages.pointFromPin(
             .viewport,
             tl_pin,
         ) orelse tl: {
@@ -1944,7 +2008,7 @@ pub fn dumpTextLocked(
 
         // Our bottom-right point. If it doesn't exist in the viewport
         // it must be the bottom-right of the viewport.
-        const br_pt = self.io.terminal.screens.active.pages.pointFromPin(
+        const br_pt = self.session.io.terminal.screens.active.pages.pointFromPin(
             .viewport,
             br_pin,
         ) orelse br: {
@@ -1952,7 +2016,7 @@ pub fn dumpTextLocked(
                 assert(vp_br_pin.before(br_pin));
             }
 
-            break :br self.io.terminal.screens.active.pages.pointFromPin(
+            break :br self.session.io.terminal.screens.active.pages.pointFromPin(
                 .viewport,
                 vp_br_pin,
             ).?;
@@ -1993,8 +2057,8 @@ pub fn dumpTextLocked(
         };
 
         // Utilize viewport sizing to convert to offsets
-        const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
-        const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+        const start = tl_coord.y * self.session.io.terminal.screens.active.pages.cols + tl_coord.x;
+        const end = br_coord.y * self.session.io.terminal.screens.active.pages.cols + br_coord.x;
 
         break :viewport .{
             .tl_px_x = x,
@@ -2014,15 +2078,15 @@ pub fn dumpTextLocked(
 pub fn hasSelection(self: *const Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.screens.active.selection != null;
+    return self.session.io.terminal.screens.active.selection != null;
 }
 
 /// Returns the selected text. This is allocated.
 pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const sel = self.io.terminal.screens.active.selection orelse return null;
-    return try self.io.terminal.screens.active.selectionString(alloc, .{
+    const sel = self.session.io.terminal.screens.active.selection orelse return null;
+    return try self.session.io.terminal.screens.active.selectionString(alloc, .{
         .sel = sel,
         .trim = false,
     });
@@ -2037,7 +2101,7 @@ pub fn pwd(
 ) Allocator.Error!?[]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const terminal_pwd = self.io.terminal.getPwd() orelse return null;
+    const terminal_pwd = self.session.io.terminal.getPwd() orelse return null;
     return try alloc.dupe(u8, terminal_pwd);
 }
 
@@ -2047,7 +2111,7 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
-        const terminal_pwd = self.io.terminal.getPwd() orelse {
+        const terminal_pwd = self.session.io.terminal.getPwd() orelse {
             return null;
         };
 
@@ -2204,9 +2268,9 @@ fn copySelectionToClipboards(
         .unwrap = true,
         .trim = self.config.clipboard_trim_trailing_spaces,
         .codepoint_map = self.config.clipboard_codepoint_map.map.list,
-        .background = self.io.terminal.colors.background.get(),
-        .foreground = self.io.terminal.colors.foreground.get(),
-        .palette = &self.io.terminal.colors.palette.current,
+        .background = self.session.io.terminal.colors.background.get(),
+        .foreground = self.session.io.terminal.colors.foreground.get(),
+        .palette = &self.session.io.terminal.colors.palette.current,
     };
 
     const ScreenFormatter = terminal.formatter.ScreenFormatter;
@@ -2214,7 +2278,7 @@ fn copySelectionToClipboards(
     var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
     switch (format) {
         .plain => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(self.session.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2224,7 +2288,7 @@ fn copySelectionToClipboards(
         },
 
         .vt => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(self.session.io.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .vt;
                 break :opts copy;
@@ -2241,7 +2305,7 @@ fn copySelectionToClipboards(
         },
 
         .html => {
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts: {
+            var formatter: ScreenFormatter = .init(self.session.io.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
                 break :opts copy;
@@ -2259,7 +2323,7 @@ fn copySelectionToClipboards(
 
         .mixed => {
             // First, generate plain text with codepoint mappings applied
-            var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
+            var formatter: ScreenFormatter = .init(self.session.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
             try contents.append(alloc, .{
@@ -2269,7 +2333,7 @@ fn copySelectionToClipboards(
 
             assert(aw.written().len == 0);
             // Second, generate HTML without codepoint mappings
-            formatter = .init(self.io.terminal.screens.active, opts: {
+            formatter = .init(self.session.io.terminal.screens.active, opts: {
                 var copy = opts;
                 copy.emit = .html;
 
@@ -2309,8 +2373,8 @@ fn copySelectionToClipboards(
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
-    const prev_ = self.io.terminal.screens.active.selection;
-    try self.io.terminal.screens.active.select(sel_);
+    const prev_ = self.session.io.terminal.screens.active.selection;
+    try self.session.io.terminal.screens.active.select(sel_);
 
     // If copy on select is false then exit early.
     if (self.config.copy_on_select == .false) return;
@@ -2479,6 +2543,89 @@ fn balancePaddingIfNeeded(self: *Surface) void {
 /// the preedit state correctly.
 ///
 /// The preedit input must be UTF-8 encoded.
+///
+/// Update the status bar content. This is the main entry point for
+/// external tools (via the control socket) to update the status bar.
+/// Pass null to clear the status bar.
+pub fn setStatusBar(self: *Surface, left: ?[]const u8, right: ?[]const u8) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // Free old status bar
+    if (self.renderer_state.status_bar) |sb| {
+        sb.deinit(self.alloc);
+        self.renderer_state.status_bar = null;
+    }
+
+    // Set new content if any
+    if (left != null or right != null) {
+        self.renderer_state.status_bar = .{
+            .left = if (left) |l| try self.alloc.dupe(u8, l) else "",
+            .right = if (right) |r| try self.alloc.dupe(u8, r) else "",
+        };
+    }
+
+    try self.queueRender();
+}
+
+/// Refresh the status bar using the built-in StatusBarWidget. Called when
+/// tabs change, focus changes, or a tab is renamed. Uses the App's surface
+/// list to populate the {tabs} widget.
+///
+/// Performance: renders to temp buffers and compares against the current
+/// status bar content. Only calls setStatusBar (which allocates + triggers
+/// a render) when the content has actually changed.
+pub fn refreshStatusBar(self: *Surface) !void {
+    if (!self.config.status_bar_enabled) return;
+
+    const StatusBarWidget = @import("StatusBarWidget.zig");
+
+    // Build tab info from the app's surface list
+    const surfaces = self.app.surfaces.items;
+    const tab_infos = try self.alloc.alloc(StatusBarWidget.TabInfo, surfaces.len);
+    defer self.alloc.free(tab_infos);
+
+    for (surfaces, 0..) |surf, i| {
+        const core_surface: *Surface = &surf.core_surface;
+        const label = if (core_surface.session.name) |n|
+            @as([]const u8, n)
+        else if (core_surface.session.title) |t|
+            @as([]const u8, t)
+        else
+            "shell";
+        tab_infos[i] = .{
+            .index = @intCast(i),
+            .label = label,
+            .is_active = (core_surface == self),
+        };
+    }
+
+    const widget = StatusBarWidget.init(self.alloc, null, null);
+    const ctx: StatusBarWidget.Context = .{
+        .session = self.session,
+        .tabs = tab_infos,
+    };
+
+    const left = try widget.renderLeft(ctx);
+    defer self.alloc.free(left);
+    const right = try widget.renderRight(ctx);
+    defer self.alloc.free(right);
+
+    // Only update if content changed (avoid allocation + render churn)
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        if (self.renderer_state.status_bar) |sb| {
+            if (std.mem.eql(u8, sb.left, left) and std.mem.eql(u8, sb.right, right)) {
+                return; // No change — skip update
+            }
+        }
+    }
+
+    try self.setStatusBar(left, right);
+}
+
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     // log.debug("text preeditCallback value={any}", .{preedit_});
 
@@ -2507,7 +2654,7 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     }
 
     // Mark preedit dirty flag
-    self.io.terminal.flags.dirty.preedit = true;
+    self.session.io.terminal.flags.dirty.preedit = true;
 
     // If we have no text, we're done. We queue a render in case we cleared
     // a prior preedit (likely).
@@ -2655,7 +2802,7 @@ pub fn keyCallback(
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
+        if (self.session.io.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
     // If this input event has text, then we hide the mouse if configured.
@@ -2679,7 +2826,7 @@ pub fn keyCallback(
         // 1. mouse reporting is off
         // OR
         // 2. mouse reporting is on and we are not reporting shift to the terminal
-        if (self.io.terminal.flags.mouse_event == .none or
+        if (self.session.io.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
         {
             // Refresh our link state
@@ -2694,12 +2841,12 @@ pub fn keyCallback(
                 log.warn("failed to refresh links err={}", .{err});
                 break :mouse_mods;
             };
-        } else if (self.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
+        } else if (self.session.io.terminal.flags.mouse_event != .none and !self.mouse.mods.shift) {
             // If we have mouse reports on and we don't have shift pressed, we reset state
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.session.io.terminal.mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2714,8 +2861,8 @@ pub fn keyCallback(
     // needed, depending on the key state.
     if ((SurfaceMouse{
         .physical_key = event.key,
-        .mouse_event = self.io.terminal.flags.mouse_event,
-        .mouse_shape = self.io.terminal.mouse_shape,
+        .mouse_event = self.session.io.terminal.flags.mouse_event,
+        .mouse_shape = self.session.io.terminal.mouse_shape,
         .mods = self.mouse.mods,
         .over_link = self.mouse.over_link,
         .hidden = self.mouse.hidden,
@@ -2757,7 +2904,7 @@ pub fn keyCallback(
         // If our process is exited and we press a key that results in
         // an encoded value, we close the surface. We want to eventually
         // move this behavior to the apprt probably.
-        if (self.child_exited) {
+        if (self.session.child_exited) {
             self.close();
             return .closed;
         }
@@ -2786,7 +2933,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.session.io.terminal.scrollViewport(.bottom);
 
         try self.queueRender();
     }
@@ -3211,7 +3358,7 @@ fn encodeKey(
 fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    const t = &self.io.terminal;
+    const t = &self.session.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
     if (comptime builtin.os.tag != .macos) return opts;
@@ -3274,6 +3421,9 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     if (focused) {
         // Notify our app if we gained focus.
         self.app.focusSurface(self);
+
+        // Refresh status bar to update active tab indicator
+        self.refreshStatusBar() catch {};
     } else unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
         // release event for it. Depending on the apprt, this CAN result in
@@ -3338,7 +3488,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     // Update the focus state and notify the terminal
     {
         self.renderer_state.mutex.lock();
-        self.io.terminal.flags.focused = focused;
+        self.session.io.terminal.flags.focused = focused;
         self.renderer_state.mutex.unlock();
         self.queueIo(.{ .focused = focused }, .unlocked);
     }
@@ -3481,16 +3631,16 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
-            self.io.terminal.flags.mouse_event == .none and
-            self.io.terminal.modes.get(.mouse_alternate_scroll))
+        if (self.session.io.terminal.screens.active_key == .alternate and
+            self.session.io.terminal.flags.mouse_event == .none and
+            self.session.io.terminal.modes.get(.mouse_alternate_scroll))
         {
             if (y.delta != 0) {
                 // When we send mouse events as cursor keys we always
                 // clear the selection.
                 try self.setSelection(null);
 
-                const seq = if (self.io.terminal.modes.get(.cursor_keys)) seq: {
+                const seq = if (self.session.io.terminal.modes.get(.cursor_keys)) seq: {
                     // cursor key: application mode
                     break :seq switch (y.direction()) {
                         .up_right => "\x1bOA",
@@ -3542,7 +3692,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.session.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -3590,7 +3740,7 @@ pub fn contentScaleCallback(self: *Surface, content_scale: apprt.ContentScale) !
 /// the terminal state.
 fn isMouseReporting(self: *const Surface) bool {
     return self.config.mouse_reporting and
-        self.io.terminal.flags.mouse_event != .none;
+        self.session.io.terminal.flags.mouse_event != .none;
 }
 
 fn mouseReport(
@@ -3602,13 +3752,13 @@ fn mouseReport(
 ) void {
     // Mouse reporting must be enabled by both config and terminal state
     assert(self.config.mouse_reporting);
-    assert(self.io.terminal.flags.mouse_event != .none);
+    assert(self.session.io.terminal.flags.mouse_event != .none);
 
     // Build our encoding options.
     const encoding_opts: input.mouse_encode.Options = opts: {
         // Terminal and size state.
         var opts: input.mouse_encode.Options = .fromTerminal(
-            &self.io.terminal,
+            &self.session.io.terminal,
             self.size,
         );
 
@@ -3673,7 +3823,7 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 
     // If the terminal explicitly requests it then we always allow it
     // since we processed never/always at this point.
-    switch (self.io.terminal.flags.mouse_shift_capture) {
+    switch (self.session.io.terminal.flags.mouse_shift_capture) {
         .false => return false,
         .true => return true,
         .null => {},
@@ -3692,7 +3842,7 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
 pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
-    return self.io.terminal.flags.mouse_event != .none;
+    return self.session.io.terminal.flags.mouse_event != .none;
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -3785,7 +3935,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
-            const prev_ = self.io.terminal.screens.active.selection;
+            const prev_ = self.session.io.terminal.screens.active.selection;
             if (prev_) |prev| {
                 try self.setSelection(terminal.Selection.init(
                     prev.start(),
@@ -3939,8 +4089,8 @@ pub fn mouseButtonCallback(
             // Single click
             1 => {
                 // If we have a selection, clear it. This always happens.
-                if (self.io.terminal.screens.active.selection != null) {
-                    try self.io.terminal.screens.active.select(null);
+                if (self.session.io.terminal.screens.active.selection != null) {
+                    try self.session.io.terminal.screens.active.select(null);
                     try self.queueRender();
                 }
             },
@@ -3961,10 +4111,10 @@ pub fn mouseButtonCallback(
                         // Ignore any errors, likely regex errors.
                     }
 
-                    break :sel self.io.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
+                    break :sel self.session.io.terminal.screens.active.selectWord(pin.*, self.config.selection_word_chars);
                 };
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.session.io.terminal.screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -3972,11 +4122,11 @@ pub fn mouseButtonCallback(
             // Triple click, select the line under our mouse
             3 => {
                 const sel_ = if (mods.ctrlOrSuper())
-                    self.io.terminal.screens.active.selectOutput(pin.*)
+                    self.session.io.terminal.screens.active.selectOutput(pin.*)
                 else
-                    self.io.terminal.screens.active.selectLine(.{ .pin = pin.* });
+                    self.session.io.terminal.screens.active.selectLine(.{ .pin = pin.* });
                 if (sel_) |sel| {
-                    try self.io.terminal.screens.active.select(sel);
+                    try self.session.io.terminal.screens.active.select(sel);
                     try self.queueRender();
                 }
             },
@@ -4027,7 +4177,7 @@ pub fn mouseButtonCallback(
             .@"context-menu" => {
                 // If we already have a selection and the selection contains
                 // where we clicked then we don't want to modify the selection.
-                if (self.io.terminal.screens.active.selection) |prev_sel| {
+                if (self.session.io.terminal.screens.active.selection) |prev_sel| {
                     if (prev_sel.contains(screen, pin)) break :sel;
 
                     // The selection doesn't contain our pin, so we create a new
@@ -4051,7 +4201,7 @@ pub fn mouseButtonCallback(
                 return false;
             },
             .copy => {
-                if (self.io.terminal.screens.active.selection) |sel| {
+                if (self.session.io.terminal.screens.active.selection) |sel| {
                     try self.copySelectionToClipboards(
                         sel,
                         &.{.standard},
@@ -4062,7 +4212,7 @@ pub fn mouseButtonCallback(
                 try self.setSelection(null);
                 try self.queueRender();
             },
-            .@"copy-or-paste" => if (self.io.terminal.screens.active.selection) |sel| {
+            .@"copy-or-paste" => if (self.session.io.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -4316,7 +4466,7 @@ fn linkAtPin(
 fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
     // In any of these scenarios, whatever mods are set (even shift)
     // are preserved.
-    if (self.io.terminal.flags.mouse_event == .none) return mods;
+    if (self.session.io.terminal.flags.mouse_event == .none) return mods;
     if (!mods.shift) return mods;
     if (self.mouseShiftCapture(false)) return mods;
 
@@ -4335,7 +4485,7 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     const link = try self.linkAtPos(pos) orelse return false;
     switch (link.action) {
         .open => {
-            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+            const str = try self.session.io.terminal.screens.active.selectionString(self.alloc, .{
                 .sel = link.selection,
                 .trim = false,
             });
@@ -4426,11 +4576,11 @@ pub fn mousePressureCallback(
         // This should always be set in this state but we don't want
         // to handle state inconsistency here.
         const pin = self.mouse.left_click_pin orelse break :select;
-        const sel = self.io.terminal.screens.active.selectWord(
+        const sel = self.session.io.terminal.screens.active.selectWord(
             pin.*,
             self.config.selection_word_chars,
         ) orelse break :select;
-        try self.io.terminal.screens.active.select(sel);
+        try self.session.io.terminal.screens.active.select(sel);
         try self.queueRender();
     }
 }
@@ -4469,7 +4619,7 @@ pub fn cursorPosCallback(
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .mouse_shape,
-                self.io.terminal.mouse_shape,
+                self.session.io.terminal.mouse_shape,
             );
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -4549,7 +4699,7 @@ pub fn cursorPosCallback(
     if ((over_link or
         self.mouse.link_point == null or
         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
-        (self.io.terminal.flags.mouse_event == .none or
+        (self.session.io.terminal.flags.mouse_event == .none or
             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
     {
         // If we were previously over a link, we always update. We do this so that if the text
@@ -4648,7 +4798,7 @@ fn dragLeftClickDouble(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.session.io.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the word closest to our starting click.
@@ -4674,13 +4824,13 @@ fn dragLeftClickDouble(
     // If our current mouse position is before the starting position,
     // then the selection start is the word nearest our current position.
     if (drag_pin.before(click_pin)) {
-        try self.io.terminal.screens.active.select(.init(
+        try self.session.io.terminal.screens.active.select(.init(
             word_current.start(),
             word_start.end(),
             false,
         ));
     } else {
-        try self.io.terminal.screens.active.select(.init(
+        try self.session.io.terminal.screens.active.select(.init(
             word_start.start(),
             word_current.end(),
             false,
@@ -4693,7 +4843,7 @@ fn dragLeftClickTriple(
     self: *Surface,
     drag_pin: terminal.Pin,
 ) !void {
-    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const screen: *terminal.Screen = self.session.io.terminal.screens.active;
     const click_pin = self.mouse.left_click_pin.?.*;
 
     // Get the line selection under our current drag point. If there isn't a
@@ -4712,7 +4862,7 @@ fn dragLeftClickTriple(
     } else {
         sel.endPtr().* = line.end();
     }
-    try self.io.terminal.screens.active.select(sel);
+    try self.session.io.terminal.screens.active.select(sel);
 }
 
 fn dragLeftClickSingle(
@@ -4721,7 +4871,7 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
-    try self.io.terminal.screens.active.select(mouseSelection(
+    try self.session.io.terminal.screens.active.select(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
@@ -4910,7 +5060,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.session.io.terminal.scrollViewport(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -5049,7 +5199,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     log.warn("error scrolling to bottom err={}", .{err});
                 };
 
-                break :normal !self.io.terminal.modes.get(.cursor_keys);
+                break :normal !self.session.io.terminal.modes.get(.cursor_keys);
             };
 
             if (normal) {
@@ -5169,7 +5319,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            if (self.io.terminal.screens.active.selection) |sel| {
+            if (self.session.io.terminal.screens.active.selection) |sel| {
                 try self.copySelectionToClipboards(
                     sel,
                     &.{.standard},
@@ -5204,7 +5354,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const url_text = switch (link_info.action) {
                     .open => url_text: {
                         // For regex links, get the text from selection
-                        break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
+                        break :url_text (self.session.io.terminal.screens.active.selectionString(self.alloc, .{
                             .sel = link_info.selection,
                             .trim = self.config.clipboard_trim_trailing_spaces,
                         })) catch |err| {
@@ -5330,6 +5480,15 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .set_tab_title => |v| {
             const title = try self.alloc.dupeZ(u8, v);
             defer self.alloc.free(title);
+
+            // Store as session name so it appears in status bar {tabs}
+            // and survives detach/reattach.
+            self.session.setName(v) catch |err|
+                log.warn("failed to persist tab name on session err={}", .{err});
+
+            // Refresh status bar on all surfaces to reflect the rename
+            self.refreshStatusBar() catch {};
+
             return try self.rt_app.performAction(
                 .{ .surface = self },
                 .set_tab_title,
@@ -5346,7 +5505,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                if (self.io.terminal.screens.active_key == .alternate) return false;
+                if (self.session.io.terminal.screens.active_key == .alternate) return false;
             }
 
             self.queueIo(.{
@@ -5381,9 +5540,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
-                const sel = self.io.terminal.screens.active.selection orelse return false;
-                const tl = sel.topLeft(self.io.terminal.screens.active);
-                self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                const sel = self.session.io.terminal.screens.active.selection orelse return false;
+                const tl = sel.topLeft(self.session.io.terminal.screens.active);
+                self.session.io.terminal.screens.active.scroll(.{ .pin = tl });
             }
 
             try self.queueRender();
@@ -5621,7 +5780,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const sel = self.io.terminal.screens.active.selectAll();
+            const sel = self.session.io.terminal.screens.active.selectAll();
             if (sel) |s| {
                 try self.setSelection(s);
                 try self.queueRender();
@@ -5640,6 +5799,41 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         ),
 
         .close_surface => self.close(),
+
+        .detach_session => {
+            // Set the IO thread to park mode so that when it stops, it
+            // preserves the subprocess instead of killing it.
+            self.session.io_thread.park_mode = true;
+
+            // Mark the session as detached (clears attached_surface).
+            self.app.detachSession(self.session);
+
+            // Close the surface. This will trigger deinit, which will
+            // stop the IO thread (in park mode) but skip destroying
+            // the session since it's been detached.
+            self.rt_surface.close(false);
+        },
+
+        .reattach_session => {
+            if (self.app.findDetachedSession() == null) {
+                log.info("reattach_session: no detached sessions available", .{});
+                return true;
+            }
+
+            // Set the flag BEFORE requesting the new tab. Since both run
+            // on the main thread, Surface.init will see the flag and attach
+            // to the detached session instead of creating a new subprocess.
+            self.app.reattach_on_next_surface = true;
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                {},
+            );
+        },
+
+        .list_sessions => {
+            self.app.logSessions();
+        },
 
         .close_window => return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5754,7 +5948,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
 
-            const screen: *terminal.Screen = self.io.terminal.screens.active;
+            const screen: *terminal.Screen = self.session.io.terminal.screens.active;
             const sel = if (screen.selection) |*sel| sel else {
                 // If we don't have a selection we do not perform this
                 // action, allowing the keybind to fall through to the
@@ -5869,12 +6063,12 @@ fn writeScreenFile(
         // We only dump history if we have history. We still keep
         // the file and write the empty file to the pty so that this
         // command always works on the primary screen.
-        const pages = &self.io.terminal.screens.active.pages;
+        const pages = &self.session.io.terminal.screens.active.pages;
         const sel_: ?terminal.Selection = switch (loc) {
             .history => history: {
                 // We do not support this for alternate screens
                 // because they don't have scrollback anyways.
-                if (self.io.terminal.screens.active_key == .alternate) {
+                if (self.session.io.terminal.screens.active_key == .alternate) {
                     break :history null;
                 }
 
@@ -5895,7 +6089,7 @@ fn writeScreenFile(
                 );
             },
 
-            .selection => self.io.terminal.screens.active.selection,
+            .selection => self.session.io.terminal.screens.active.selection,
         };
 
         const sel = sel_ orelse {
@@ -5905,7 +6099,7 @@ fn writeScreenFile(
         };
 
         const ScreenFormatter = terminal.formatter.ScreenFormatter;
-        var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, .{
+        var formatter: ScreenFormatter = .init(self.session.io.terminal.screens.active, .{
             .emit = switch (write_screen.emit) {
                 .plain => .plain,
                 .vt => .vt,
@@ -5913,12 +6107,12 @@ fn writeScreenFile(
             },
             .unwrap = true,
             .trim = false,
-            .background = self.io.terminal.colors.background.get(),
-            .foreground = self.io.terminal.colors.foreground.get(),
-            .palette = &self.io.terminal.colors.palette.current,
+            .background = self.session.io.terminal.colors.background.get(),
+            .foreground = self.session.io.terminal.colors.foreground.get(),
+            .palette = &self.session.io.terminal.colors.palette.current,
         });
         formatter.content = .{ .selection = sel.ordered(
-            self.io.terminal.screens.active,
+            self.session.io.terminal.screens.active,
             .forward,
         ) };
         try formatter.format(buf_writer);
@@ -6027,7 +6221,7 @@ fn completeClipboardPaste(
     const encode_opts: input.paste.Options = encode_opts: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
+        const opts: input.paste.Options = .fromTerminal(&self.session.io.terminal);
 
         // If we have paste protection enabled, we detect unsafe pastes and return
         // an error. The error approach allows apprt to attempt to complete the paste

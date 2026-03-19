@@ -61,6 +61,23 @@ pub const DaemonSession = struct {
     cursor_y: u16 = 0,
     cursor_visible: bool = true,
 
+    /// Alternate screen buffer (for vim, less, etc.)
+    alt_cells: ?[]Protocol.WireCell = null,
+    /// Saved main screen state (cells + cursor) when switched to alt screen.
+    saved_main_cells: ?[]Protocol.WireCell = null,
+    saved_main_cursor_x: u16 = 0,
+    saved_main_cursor_y: u16 = 0,
+    /// True when the alternate screen is active.
+    alt_screen_active: bool = false,
+
+    /// Saved cursor state (DECSC/DECRC, ESC 7/8).
+    saved_cursor_x: u16 = 0,
+    saved_cursor_y: u16 = 0,
+
+    /// Mode flags reported to clients.
+    bracketed_paste: bool = false,
+    application_cursor_keys: bool = false,
+
     /// Dirty row tracking. One bit per row — set when cells change.
     dirty_rows: std.DynamicBitSet,
 
@@ -92,9 +109,50 @@ pub const DaemonSession = struct {
         self.alloc.free(self.pwd);
         self.alloc.free(self.command);
         self.alloc.free(self.cells);
+        if (self.alt_cells) |ac| self.alloc.free(ac);
+        if (self.saved_main_cells) |mc| self.alloc.free(mc);
         self.dirty_rows.deinit();
         for (self.scrollback.items) |row| self.alloc.free(row);
         self.scrollback.deinit(self.alloc);
+    }
+
+    /// Switch to alternate screen buffer (mode 1049).
+    pub fn switchToAltScreen(self: *DaemonSession) void {
+        if (self.alt_screen_active) return;
+
+        const cell_count = @as(usize, self.rows) * @as(usize, self.cols);
+
+        // Save current (main) screen
+        if (self.saved_main_cells == null) {
+            self.saved_main_cells = self.alloc.alloc(Protocol.WireCell, cell_count) catch return;
+        }
+        @memcpy(self.saved_main_cells.?, self.cells[0..cell_count]);
+        self.saved_main_cursor_x = self.cursor_x;
+        self.saved_main_cursor_y = self.cursor_y;
+
+        // Clear the screen for alt buffer
+        @memset(self.cells, Protocol.WireCell{});
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.alt_screen_active = true;
+        self.markAllDirty();
+    }
+
+    /// Switch back to main screen buffer (mode 1049 reset).
+    pub fn switchToMainScreen(self: *DaemonSession) void {
+        if (!self.alt_screen_active) return;
+
+        const cell_count = @as(usize, self.rows) * @as(usize, self.cols);
+
+        // Restore main screen
+        if (self.saved_main_cells) |saved| {
+            const copy_len = @min(saved.len, cell_count);
+            @memcpy(self.cells[0..copy_len], saved[0..copy_len]);
+        }
+        self.cursor_x = self.saved_main_cursor_x;
+        self.cursor_y = self.saved_main_cursor_y;
+        self.alt_screen_active = false;
+        self.markAllDirty();
     }
 
     /// Mark all rows as dirty (e.g., after resize or new attach).

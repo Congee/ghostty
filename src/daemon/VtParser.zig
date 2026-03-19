@@ -231,8 +231,16 @@ fn processEscape(self: *VtParser, s: *SessionManager.DaemonSession, byte: u8) vo
             self.resetState(s);
             self.state = .ground;
         },
-        '7' => self.state = .ground, // Save cursor — stub
-        '8' => self.state = .ground, // Restore cursor — stub
+        '7' => { // DECSC — Save cursor position + attributes
+            s.saved_cursor_x = s.cursor_x;
+            s.saved_cursor_y = s.cursor_y;
+            self.state = .ground;
+        },
+        '8' => { // DECRC — Restore cursor position + attributes
+            s.cursor_x = @min(s.saved_cursor_x, s.cols -| 1);
+            s.cursor_y = @min(s.saved_cursor_y, s.rows -| 1);
+            self.state = .ground;
+        },
         '=' => self.state = .ground, // Keypad application mode — ignore
         '>' => self.state = .ground, // Keypad numeric mode — ignore
         else => self.state = .ground, // Unknown — back to ground
@@ -523,7 +531,16 @@ fn dispatchDecPrivate(self: *VtParser, s: *SessionManager.DaemonSession, final: 
         'h' => { // DECSET
             for (self.params[0..self.param_count]) |p| {
                 switch (p) {
-                    25 => s.cursor_visible = true, // Show cursor
+                    1 => s.application_cursor_keys = true,
+                    25 => s.cursor_visible = true,
+                    1049 => {
+                        // Save cursor then switch to alt screen
+                        s.saved_cursor_x = s.cursor_x;
+                        s.saved_cursor_y = s.cursor_y;
+                        s.switchToAltScreen();
+                    },
+                    1047 => s.switchToAltScreen(),
+                    2004 => s.bracketed_paste = true,
                     else => {},
                 }
             }
@@ -531,7 +548,16 @@ fn dispatchDecPrivate(self: *VtParser, s: *SessionManager.DaemonSession, final: 
         'l' => { // DECRST
             for (self.params[0..self.param_count]) |p| {
                 switch (p) {
-                    25 => s.cursor_visible = false, // Hide cursor
+                    1 => s.application_cursor_keys = false,
+                    25 => s.cursor_visible = false,
+                    1049 => {
+                        // Switch back to main screen then restore cursor
+                        s.switchToMainScreen();
+                        s.cursor_x = s.saved_cursor_x;
+                        s.cursor_y = s.saved_cursor_y;
+                    },
+                    1047 => s.switchToMainScreen(),
+                    2004 => s.bracketed_paste = false,
                     else => {},
                 }
             }
@@ -1332,4 +1358,99 @@ test "OSC title updates replace previous" {
 
     parser.feed(s, "\x1b]2;second\x07");
     try std.testing.expectEqualStrings("second", s.title);
+}
+
+test "alternate screen buffer (mode 1049)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(5, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    // Write to main screen
+    parser.feed(s, "HELLO");
+    try std.testing.expectEqual(@as(u32, 'H'), s.getCell(0, 0).codepoint);
+    try std.testing.expect(!s.alt_screen_active);
+
+    // Switch to alt screen (ESC[?1049h)
+    parser.feed(s, "\x1b[?1049h");
+    try std.testing.expect(s.alt_screen_active);
+    // Alt screen should be blank
+    try std.testing.expectEqual(@as(u32, 0), s.getCell(0, 0).codepoint);
+
+    // Write on alt screen
+    parser.feed(s, "VIM");
+    try std.testing.expectEqual(@as(u32, 'V'), s.getCell(0, 0).codepoint);
+
+    // Switch back to main screen (ESC[?1049l)
+    parser.feed(s, "\x1b[?1049l");
+    try std.testing.expect(!s.alt_screen_active);
+    // Main screen should be restored
+    try std.testing.expectEqual(@as(u32, 'H'), s.getCell(0, 0).codepoint);
+}
+
+test "cursor save/restore (DECSC/DECRC)" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 5, null);
+    var parser = VtParser.init(s.rows);
+
+    // Move cursor to (3, 2)
+    parser.feed(s, "\x1b[3;4H"); // row 3, col 4 (1-based) = (3, 2) 0-based
+    try std.testing.expectEqual(@as(u16, 3), s.cursor_x);
+    try std.testing.expectEqual(@as(u16, 2), s.cursor_y);
+
+    // Save cursor (ESC 7)
+    parser.feed(s, "\x1b7");
+
+    // Move cursor elsewhere
+    parser.feed(s, "\x1b[1;1H");
+    try std.testing.expectEqual(@as(u16, 0), s.cursor_x);
+    try std.testing.expectEqual(@as(u16, 0), s.cursor_y);
+
+    // Restore cursor (ESC 8)
+    parser.feed(s, "\x1b8");
+    try std.testing.expectEqual(@as(u16, 3), s.cursor_x);
+    try std.testing.expectEqual(@as(u16, 2), s.cursor_y);
+}
+
+test "bracketed paste mode" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    try std.testing.expect(!s.bracketed_paste);
+
+    // Enable bracketed paste (ESC[?2004h)
+    parser.feed(s, "\x1b[?2004h");
+    try std.testing.expect(s.bracketed_paste);
+
+    // Disable bracketed paste (ESC[?2004l)
+    parser.feed(s, "\x1b[?2004l");
+    try std.testing.expect(!s.bracketed_paste);
+}
+
+test "application cursor keys mode" {
+    const alloc = std.testing.allocator;
+    var mgr = SessionManager.initTest(alloc);
+    defer mgr.deinit();
+
+    const s = try mgr.createSession(10, 3, null);
+    var parser = VtParser.init(s.rows);
+
+    try std.testing.expect(!s.application_cursor_keys);
+
+    // Enable (ESC[?1h)
+    parser.feed(s, "\x1b[?1h");
+    try std.testing.expect(s.application_cursor_keys);
+
+    // Disable (ESC[?1l)
+    parser.feed(s, "\x1b[?1l");
+    try std.testing.expect(!s.application_cursor_keys);
 }

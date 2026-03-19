@@ -95,13 +95,22 @@ fn startDaemon(socket_path: []const u8) !void {
         return;
     }
 
-    // First child: fork again and exit
+    // First child: become session leader, then fork again
+    _ = setsid();
+
     const pid2 = std.c.fork();
     if (pid2 < 0) std.c.exit(1);
     if (pid2 > 0) std.c.exit(0);
 
-    // Grandchild: this becomes the daemon process
-    _ = setsid();
+    // Grandchild: this becomes the daemon process (not a session leader,
+    // so it cannot accidentally acquire a controlling terminal).
+
+    // Close all inherited file descriptors > 2 to avoid leaking
+    // parent's sockets, GUI handles, etc. into the long-lived daemon.
+    var close_fd: posix.fd_t = 3;
+    while (close_fd < 1024) : (close_fd += 1) {
+        _ = std.c.close(close_fd);
+    }
 
     // Redirect stdin/stdout to /dev/null, keep stderr for logging
     const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);

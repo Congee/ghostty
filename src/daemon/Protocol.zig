@@ -372,9 +372,9 @@ pub fn decodeSessionList(alloc: Allocator, payload: []const u8) ![]SessionEntry 
     var initialized: usize = 0;
     errdefer {
         for (entries[0..initialized]) |*e| {
-            if (e.name.len > 0) alloc.free(e.name);
-            if (e.title.len > 0) alloc.free(e.title);
-            if (e.pwd.len > 0) alloc.free(e.pwd);
+            alloc.free(e.name);
+            alloc.free(e.title);
+            alloc.free(e.pwd);
         }
         alloc.free(entries);
     }
@@ -424,9 +424,9 @@ pub fn decodeSessionList(alloc: Allocator, payload: []const u8) ![]SessionEntry 
 /// Free a decoded session list.
 pub fn freeSessionList(alloc: Allocator, entries: []SessionEntry) void {
     for (entries) |*e| {
-        if (e.name.len > 0) alloc.free(e.name);
-        if (e.title.len > 0) alloc.free(e.title);
-        if (e.pwd.len > 0) alloc.free(e.pwd);
+        alloc.free(e.name);
+        alloc.free(e.title);
+        alloc.free(e.pwd);
     }
     alloc.free(entries);
 }

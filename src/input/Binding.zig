@@ -681,6 +681,18 @@ pub const Action = union(enum) {
     /// of the `confirm-close-surface` configuration setting.
     close_surface,
 
+    /// Detach the current session. The terminal process and state are preserved
+    /// but the surface (window/tab) is closed. The session can be reattached
+    /// to a new surface later.
+    detach_session,
+
+    /// Reattach the most recently detached session to a new surface.
+    /// If there are no detached sessions, this is a no-op.
+    reattach_session,
+
+    /// List all sessions (attached and detached) to the log.
+    list_sessions,
+
     /// Close the current tab and all splits therein, close all other tabs, or
     /// close every tab to the right of the current one depending on the mode.
     ///
@@ -1352,6 +1364,9 @@ pub const Action = union(enum) {
             .write_screen_file,
             .write_selection_file,
             .close_surface,
+            .detach_session,
+            .reattach_session,
+            .list_sessions,
             .close_tab,
             .close_window,
             .toggle_maximize,

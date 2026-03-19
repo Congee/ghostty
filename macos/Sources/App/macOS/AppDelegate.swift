@@ -446,7 +446,15 @@ class AppDelegate: NSObject,
         // but I haven't seen it happen in releases. I'm unsure why.
         guard applicationHasBecomeActive else { return true }
 
-        // No visible windows, open a new one.
+        // If there are detached sessions, reattach the most recent one
+        // instead of creating a fresh window. The flag is set BEFORE
+        // surface creation so Surface.init picks it up synchronously.
+        if let app = ghostty.app, ghostty_app_has_detached_sessions(app) {
+            ghostty_app_reattach_on_next_surface(app)
+        }
+
+        // Open a new window. If reattach flag was set above, the surface
+        // will attach to the detached session instead of spawning a new shell.
         _ = TerminalController.newWindow(ghostty)
         return false
     }

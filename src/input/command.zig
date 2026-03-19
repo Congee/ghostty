@@ -579,6 +579,24 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = "Close the current terminal.",
         }},
 
+        .detach_session => comptime &.{.{
+            .action = .detach_session,
+            .title = "Detach Session",
+            .description = "Detach the terminal session, keeping the process alive.",
+        }},
+
+        .reattach_session => comptime &.{.{
+            .action = .reattach_session,
+            .title = "Reattach Session",
+            .description = "Reattach the most recently detached session to a new surface.",
+        }},
+
+        .list_sessions => comptime &.{.{
+            .action = .list_sessions,
+            .title = "List Sessions",
+            .description = "List all sessions (attached and detached) to the log.",
+        }},
+
         .close_tab => comptime &.{
             .{
                 .action = .{ .close_tab = .this },

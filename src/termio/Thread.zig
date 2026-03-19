@@ -72,6 +72,14 @@ sync_reset: xev.Timer,
 sync_reset_c: xev.Completion = .{},
 sync_reset_cancel_c: xev.Completion = .{},
 
+/// When true, the IO thread will park (preserve subprocess) instead of
+/// performing a full exit when the stop signal is received.
+park_mode: bool = false,
+
+/// When true, threadMain_ will call threadReenter instead of threadEnter.
+/// Set for resumed sessions where the subprocess is already running.
+resume_mode: bool = false,
+
 flags: packed struct {
     /// This is set to true only when an abnormal exit is detected. It
     /// tells our mailbox system to drain and ignore all messages.
@@ -264,9 +272,26 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     // to hook into the event loop as needed. The thread data is created
     // on the stack here so that it has a stable pointer throughout the
     // lifetime of the thread.
-    try io.threadEnter(self, &cb.data);
-    defer cb.data.deinit();
-    defer io.threadExit(&cb.data);
+    if (self.resume_mode) {
+        try io.threadReenter(self, &cb.data);
+        self.resume_mode = false;
+    } else {
+        try io.threadEnter(self, &cb.data);
+    }
+    defer {
+        if (self.park_mode) {
+            // Park mode: stop the read infrastructure but keep the subprocess
+            // alive. Preserve ThreadData on the session's heap so it survives
+            // this thread's stack frame being destroyed.
+            io.park(&cb.data);
+            io.surface_mailbox.surface.session.parkThreadData(&cb.data) catch |err|
+                log.err("error parking thread data err={}", .{err});
+        } else {
+            // Normal exit: full teardown.
+            io.threadExit(&cb.data);
+            cb.data.deinit();
+        }
+    }
 
     // Start the async handlers.
     mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
@@ -463,7 +488,11 @@ fn stopCallback(
     _: *xev.Completion,
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
-    _ = r catch unreachable;
+    _ = r catch |err| {
+        log.err("stop callback error: {}", .{err});
+        if (cb_) |cb| cb.self.loop.stop();
+        return .disarm;
+    };
     cb_.?.self.loop.stop();
     return .disarm;
 }

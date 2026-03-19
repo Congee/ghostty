@@ -1096,6 +1096,13 @@ GHOSTTY_API bool ghostty_app_needs_confirm_quit(ghostty_app_t);
 GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
 
+/// Returns true if there are detached sessions that can be reattached.
+GHOSTTY_API bool ghostty_app_has_detached_sessions(ghostty_app_t);
+
+/// Call BEFORE ghostty_surface_new to make the next surface reattach
+/// to the most recent detached session instead of creating a new one.
+GHOSTTY_API void ghostty_app_reattach_on_next_surface(ghostty_app_t);
+
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,

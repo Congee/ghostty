@@ -88,30 +88,49 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
-    // Start our subprocess
-    const pty_fds = self.subprocess.start(alloc) catch |err| {
-        // If we specifically got this error then we are in the forked
-        // process and our child failed to execute. If we DIDN'T
-        // get this specific error then we're in the parent and
-        // we need to bubble it up.
-        if (err != error.ExecFailedInChild) return err;
+    return self.threadEnterInner(alloc, io, td, false);
+}
 
-        // We're in the child. Nothing more we can do but abnormal exit.
-        // The Command will output some additional information.
-        posix.exit(1);
+/// Re-enter the thread for a resumed session. The subprocess is already
+/// running — skip start, just reconnect the pty fds.
+pub fn threadReenter(
+    self: *Exec,
+    alloc: Allocator,
+    io: *termio.Termio,
+    td: *termio.Termio.ThreadData,
+) !void {
+    return self.threadEnterInner(alloc, io, td, true);
+}
+
+fn threadEnterInner(
+    self: *Exec,
+    alloc: Allocator,
+    io: *termio.Termio,
+    td: *termio.Termio.ThreadData,
+    is_reenter: bool,
+) !void {
+    // Start our subprocess (or get existing pty fds for reenter)
+    const pty_fds: struct { read: Pty.Fd, write: Pty.Fd } = if (is_reenter) blk: {
+        const fds = self.subprocess.ptyFds() orelse return error.SubprocessNotRunning;
+        break :blk .{ .read = fds.read, .write = fds.write };
+    } else blk: {
+        const fds = self.subprocess.start(alloc) catch |err| {
+            if (err != error.ExecFailedInChild) return err;
+            posix.exit(1);
+        };
+        break :blk .{ .read = fds.read, .write = fds.write };
     };
-    errdefer self.subprocess.stop();
+    errdefer if (!is_reenter) self.subprocess.stop();
 
-    // Watcher to detect subprocess exit
-    var process: ?xev.Process = if (self.subprocess.process) |v| switch (v) {
+    // Watcher to detect subprocess exit.
+    // For reenter (resume after detach), skip the process watcher entirely.
+    // The xev kqueue EVFILT_PROC watcher hits unreachable in xev with ESRCH
+    // if the process died during detach (TOCTOU race). The read thread
+    // detects process exit via pty EOF, so the watcher is not needed.
+    var process: ?xev.Process = if (is_reenter) null else if (self.subprocess.process) |v| switch (v) {
         .fork_exec => |cmd| try xev.Process.init(
             cmd.pid orelse return error.ProcessNoPid,
         ),
-
-        // If we're executing via Flatpak then we can't do
-        // traditional process watching (its implemented
-        // as a special case in os/flatpak.zig) since the
-        // command is on the host.
         .flatpak => null,
     } else return error.ProcessNotStarted;
     errdefer if (process) |*p| p.deinit();
@@ -227,6 +246,37 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     exec.read_thread.join();
 }
 
+/// Park the IO thread without killing the subprocess. The PTY and child
+/// process remain alive, but the read thread is stopped. This is like
+/// threadExit but does NOT call subprocess.stop().
+pub fn threadPark(self: *Exec, td: *termio.Termio.ThreadData) void {
+    _ = self;
+    assert(td.backend == .exec);
+    const exec = &td.backend.exec;
+
+    // Stop the read thread by writing to its quit pipe.
+    _ = posix.write(exec.read_thread_pipe, "x") catch |err| switch (err) {
+        error.BrokenPipe => {},
+        else => log.warn(
+            "error writing to read thread quit pipe err={}",
+            .{err},
+        ),
+    };
+
+    if (comptime builtin.os.tag == .windows) {
+        if (windows.kernel32.CancelIoEx(exec.read_thread_fd, null) == 0) {
+            switch (windows.kernel32.GetLastError()) {
+                .NOT_FOUND => {},
+                else => |err| log.warn("error interrupting read thread err={}", .{err}),
+            }
+        }
+    }
+
+    exec.read_thread.join();
+}
+
+
+
 pub fn focusGained(
     self: *Exec,
     td: *termio.Termio.ThreadData,
@@ -299,7 +349,11 @@ fn processExit(
     _: *xev.Completion,
     r: xev.Process.WaitError!u32,
 ) xev.CallbackAction {
-    const exit_code = r catch unreachable;
+    const exit_code = r catch |err| {
+        log.err("process wait error: {}", .{err});
+        if (td_) |td| processExitCommon(td, 255);
+        return .disarm;
+    };
     processExitCommon(td_.?, exit_code);
     return .disarm;
 }
@@ -1075,6 +1129,22 @@ const Subprocess = struct {
     fn childPreExec(self: *Subprocess) !void {
         // Setup our pty
         try self.pty.?.childPreExec();
+    }
+
+    /// Get the PTY file descriptors if the subprocess is running.
+    /// Returns null if the pty hasn't been opened.
+    pub fn ptyFds(self: *Subprocess) ?struct { read: Pty.Fd, write: Pty.Fd } {
+        const pty = self.pty orelse return null;
+        return switch (builtin.os.tag) {
+            .windows => .{
+                .read = pty.out_pipe,
+                .write = pty.in_pipe,
+            },
+            else => .{
+                .read = pty.master,
+                .write = pty.master,
+            },
+        };
     }
 
     /// Called to notify that we exited externally so we can unset our

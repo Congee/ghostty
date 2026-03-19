@@ -1516,6 +1516,17 @@ pub const CAPI = struct {
         return v.hasGlobalKeybinds();
     }
 
+    /// Returns true if there are detached sessions available for reattach.
+    export fn ghostty_app_has_detached_sessions(v: *App) bool {
+        return v.core_app.findDetachedSession() != null;
+    }
+
+    /// Set the reattach flag so the next surface creation attaches to
+    /// the most recent detached session instead of spawning a new process.
+    export fn ghostty_app_reattach_on_next_surface(v: *App) void {
+        v.core_app.reattach_on_next_surface = true;
+    }
+
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
@@ -1595,7 +1606,7 @@ pub const CAPI = struct {
 
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
-        return surface.core_surface.child_exited;
+        return surface.core_surface.session.child_exited;
     }
 
     /// Returns true if the surface has a selection.
@@ -1614,7 +1625,7 @@ pub const CAPI = struct {
         defer core_surface.renderer_state.mutex.unlock();
 
         // If we don't have a selection, do nothing.
-        const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
+        const core_sel = core_surface.session.io.terminal.screens.active.selection orelse return false;
 
         // Read the text from the selection.
         return readTextLocked(surface, core_sel, result);
@@ -2193,7 +2204,7 @@ pub const CAPI = struct {
                     if (comptime std.debug.runtime_safety) unreachable;
                     return false;
                 };
-                break :sel surface.io.terminal.screens.active.selectWord(
+                break :sel surface.session.io.terminal.screens.active.selectWord(
                     pin,
                     surface.config.selection_word_chars,
                 ) orelse return false;

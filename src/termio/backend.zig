@@ -47,9 +47,26 @@ pub const Backend = union(Kind) {
         }
     }
 
+    pub fn threadReenter(
+        self: *Backend,
+        alloc: Allocator,
+        io: *termio.Termio,
+        td: *termio.Termio.ThreadData,
+    ) !void {
+        switch (self.*) {
+            .exec => |*exec| try exec.threadReenter(alloc, io, td),
+        }
+    }
+
     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
             .exec => |*exec| exec.threadExit(td),
+        }
+    }
+
+    pub fn threadPark(self: *Backend, td: *termio.Termio.ThreadData) void {
+        switch (self.*) {
+            .exec => |*exec| exec.threadPark(td),
         }
     }
 

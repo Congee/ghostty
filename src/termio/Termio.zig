@@ -388,9 +388,60 @@ pub fn threadEnter(
     };
 }
 
+/// Re-enter the IO thread for a resumed session. Like threadEnter but
+/// skips subprocess start (it's already running).
+pub fn threadReenter(
+    self: *Termio,
+    thread: *termio.Thread,
+    data: *ThreadData,
+) !void {
+    data.* = .{
+        .alloc = self.alloc,
+        .loop = &thread.loop,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .mailbox = &self.mailbox,
+        .backend = undefined,
+    };
+
+    try self.backend.threadReenter(self.alloc, self, data);
+}
+
 pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
+
+/// Park the IO: stop the backend's read infrastructure but keep the
+/// subprocess alive. Also null out renderer/surface pointers since
+/// the surface is going away.
+pub fn park(self: *Termio, data: *ThreadData) void {
+    self.backend.threadPark(data);
+}
+
+/// Reconnect renderer/surface pointers after a park. Safe to call
+/// from the main thread before the IO thread starts.
+pub fn reconnectPointers(self: *Termio, opts: ReattachOptions) void {
+    self.renderer_state = opts.renderer_state;
+    self.renderer_wakeup = opts.renderer_wakeup;
+    self.renderer_mailbox = opts.renderer_mailbox;
+    self.surface_mailbox = opts.surface_mailbox;
+
+    self.terminal_stream.handler.renderer_state = opts.renderer_state;
+    self.terminal_stream.handler.renderer_wakeup = opts.renderer_wakeup;
+    self.terminal_stream.handler.renderer_mailbox = opts.renderer_mailbox;
+    self.terminal_stream.handler.surface_mailbox = opts.surface_mailbox;
+
+    self.size = opts.size;
+}
+
+/// Options for reattaching a session to a new surface.
+pub const ReattachOptions = struct {
+    renderer_state: *renderer.State,
+    renderer_wakeup: xev.Async,
+    renderer_mailbox: *renderer.Thread.Mailbox,
+    surface_mailbox: apprt.surface.Mailbox,
+    size: renderer.Size,
+};
 
 /// Send a message to the mailbox. Depending on the mailbox type in use
 /// this may process now or it may just enqueue and process later.

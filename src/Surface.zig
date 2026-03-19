@@ -2670,27 +2670,118 @@ pub fn refreshStatusBar(self: *Surface) !void {
     try w.writeAll("\x1b[7m"); // Reverse video for status bar background
     try w.writeAll("\x1b[K"); // Clear line
 
-    // Build click regions while writing components
     var click_regions = std.ArrayList(rendererpkg.State.ClickRegion).init(self.alloc);
     defer click_regions.deinit();
     var col_pos: u16 = 0;
 
-    // Write left components
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+    // ── Phase 1: Calculate tab width (always highest priority) ──
+    const surfaces = self.app.surfaces.items;
+    var tab_width: u16 = 0;
+    for (surfaces, 0..) |surf, i| {
+        const core_surface: *Surface = &surf.core_surface;
+        const label = core_surface.session.displayLabel();
+        tab_width += 1; // space
+        var iv = i;
+        var digits: u16 = 1;
+        while (iv >= 10) : (iv /= 10) digits += 1;
+        tab_width += digits + 1; // digits + ':'
+        tab_width += @intCast(label.len);
+        if (core_surface == self) tab_width += 1; // '*'
+    }
 
-        if (self.renderer_state.status_bar) |sb| {
-            for (sb.left_components) |comp| {
+    // ── Phase 2: Budget remaining space for external components ──
+    const remaining: u16 = if (cols > tab_width) cols - tab_width else 0;
+
+    // Gather left and right components with their widths
+    self.renderer_state.mutex.lock();
+    const sb = self.renderer_state.status_bar;
+    self.renderer_state.mutex.unlock();
+
+    // Calculate which components fit by priority (descending).
+    // We include components greedily: highest priority first, skip if no space.
+    var left_budget: u16 = remaining / 2; // half for left
+    const right_budget: u16 = remaining - left_budget; // rest for right
+
+    // ── Phase 3: Write left components (high priority first, skip if no space) ──
+    if (sb) |s| {
+        for (s.left_components) |comp| {
+            const comp_width: u16 = @intCast(comp.text.len);
+            if (comp_width > left_budget) continue; // drop — no space
+            const start = col_pos;
+            try writeComponentEsc(w, comp);
+            col_pos += comp_width;
+            left_budget -= comp_width;
+            if (comp.click) |cl| {
+                try click_regions.append(.{
+                    .x_start = start,
+                    .x_end = col_pos,
+                    .click_id = cl.id,
+                    .source_id = s.left_source,
+                    .action = cl.action,
+                });
+            }
+        }
+    }
+
+    // ── Phase 4: Write tabs (always included) ──
+    try w.writeAll("\x1b[0m\x1b[7m");
+    for (surfaces, 0..) |surf, i| {
+        const core_surface: *Surface = &surf.core_surface;
+        const label = core_surface.session.displayLabel();
+        const is_active = (core_surface == self);
+
+        if (is_active) try w.writeAll("\x1b[1m");
+
+        const tab_start = col_pos;
+        try w.print(" {d}:{s}", .{ i, label });
+        col_pos += 1;
+        var iv = i;
+        var digits: u16 = 1;
+        while (iv >= 10) : (iv /= 10) digits += 1;
+        col_pos += digits + 1;
+        col_pos += @intCast(label.len);
+
+        if (is_active) {
+            try w.writeAll("*\x1b[22m");
+            col_pos += 1;
+        }
+
+        try click_regions.append(.{
+            .x_start = tab_start,
+            .x_end = col_pos,
+            .click_id = "",
+            .source_id = "",
+            .action = .{ .key = "" },
+        });
+    }
+
+    // ── Phase 5: Write right components (right-aligned, skip if no space) ──
+    if (sb) |s| {
+        if (s.right_components.len > 0) {
+            // Calculate total width of components that fit
+            var total_right: u16 = 0;
+            for (s.right_components) |comp| {
+                const cw: u16 = @intCast(comp.text.len);
+                if (cw <= right_budget - total_right) {
+                    total_right += cw;
+                }
+            }
+            if (total_right > 0 and total_right < cols) {
+                col_pos = cols - total_right;
+                try w.print("\x1b[{d};{d}H", .{ status_row, col_pos + 1 });
+            }
+            for (s.right_components) |comp| {
+                const cw: u16 = @intCast(comp.text.len);
+                if (col_pos + cw > cols) continue;
                 const start = col_pos;
                 try writeComponentEsc(w, comp);
-                col_pos += @intCast(comp.text.len);
+                col_pos += cw;
                 if (comp.click) |cl| {
                     try click_regions.append(.{
                         .x_start = start,
                         .x_end = col_pos,
                         .click_id = cl.id,
-                        .source_id = sb.left_source,
+                        .source_id = s.right_source,
                         .action = cl.action,
                     });
                 }
@@ -2698,85 +2789,13 @@ pub fn refreshStatusBar(self: *Surface) !void {
         }
     }
 
-    // Write tabs in the middle
-    try w.writeAll("\x1b[0m\x1b[7m"); // Reset to reverse video
-    const surfaces = self.app.surfaces.items;
-    for (surfaces, 0..) |surf, i| {
-        const core_surface: *Surface = &surf.core_surface;
-        const label = core_surface.session.displayLabel();
-        const is_active = (core_surface == self);
-
-        if (is_active) {
-            try w.writeAll("\x1b[1m"); // Bold for active tab
-        }
-
-        // Tab format: " idx:label" or " idx:label*"
-        const tab_start = col_pos;
-        try w.print(" {d}:{s}", .{ i, label });
-        col_pos += 1; // space
-        // Count digits in index
-        var idx_val = i;
-        var idx_digits: u16 = 1;
-        while (idx_val >= 10) : (idx_val /= 10) idx_digits += 1;
-        col_pos += idx_digits + 1; // digits + ':'
-        col_pos += @intCast(label.len);
-
-        if (is_active) {
-            try w.writeAll("*\x1b[22m");
-            col_pos += 1; // '*'
-        }
-
-        // Tab click region — uses goto_tab action
-        try click_regions.append(.{
-            .x_start = tab_start,
-            .x_end = col_pos,
-            .click_id = "",
-            .source_id = "",
-            .action = .{ .key = "" }, // handled specially in click dispatch
-        });
-        // tab_start used above in click_regions.append
-    }
-
-    // Write right components (right-aligned)
+    // Store click regions on the live status bar state
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-
-        if (self.renderer_state.status_bar) |sb| {
-            if (sb.right_components.len > 0) {
-                var right_width: u16 = 0;
-                for (sb.right_components) |comp| {
-                    right_width += @intCast(comp.text.len);
-                }
-                if (right_width < cols) {
-                    col_pos = cols - right_width;
-                    try w.print("\x1b[{d};{d}H", .{ status_row, col_pos + 1 });
-                }
-                for (sb.right_components) |comp| {
-                    const start = col_pos;
-                    try writeComponentEsc(w, comp);
-                    col_pos += @intCast(comp.text.len);
-                    if (comp.click) |cl| {
-                        try click_regions.append(.{
-                            .x_start = start,
-                            .x_end = col_pos,
-                            .click_id = cl.id,
-                            .source_id = sb.right_source,
-                            .action = cl.action,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Store click regions in status bar state
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        if (self.renderer_state.status_bar) |*sb| {
-            if (sb.click_regions.len > 0) self.alloc.free(sb.click_regions);
-            sb.click_regions = try click_regions.toOwnedSlice();
+        if (self.renderer_state.status_bar) |*live_sb| {
+            if (live_sb.click_regions.len > 0) self.alloc.free(live_sb.click_regions);
+            live_sb.click_regions = try click_regions.toOwnedSlice();
         }
     }
 

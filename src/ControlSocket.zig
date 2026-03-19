@@ -404,7 +404,12 @@ fn parseOneComponent(alloc: Allocator, val: std.json.Value) !Component {
         click = .{ .id = id, .action = action };
     }
 
-    return .{ .text = text, .style = style, .click = click };
+    const priority: u8 = if (obj.get("priority")) |p|
+        @intCast(p.integer)
+    else
+        100;
+
+    return .{ .text = text, .style = style, .click = click, .priority = priority };
 }
 
 fn parseHexColor(s: []const u8) ?[3]u8 {

@@ -138,6 +138,11 @@ pub const Component = struct {
     /// Click handler. If set, this segment is clickable.
     click: ?ClickAction = null,
 
+    /// Priority for layout (higher = more important, kept when space is tight).
+    /// Ghostty tabs are always rendered at priority max (255).
+    /// Default external component priority is 100.
+    priority: u8 = 100,
+
     pub const ComponentStyle = struct {
         fg: ?[3]u8 = null, // RGB
         bg: ?[3]u8 = null, // RGB

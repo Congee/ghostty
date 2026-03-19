@@ -8,8 +8,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const PtyReader = @import("PtyReader.zig");
+const vt = @import("vt");
 
 const log = std.log.scoped(.session_mgr);
 
@@ -53,38 +54,21 @@ pub const DaemonSession = struct {
     cols: u16,
     rows: u16,
 
-    /// Terminal cell grid. Flat array: cells[row * cols + col].
+    /// The real Ghostty terminal emulator (handles all VT sequences,
+    /// alternate screen, cursor save/restore, scrollback, etc.).
+    terminal: vt.Terminal,
+
+    /// Wire-format cell cache, populated by snapshotCells() after feeding
+    /// PTY data to the terminal. Flat array: cells[row * cols + col].
     cells: []Protocol.WireCell,
 
-    /// Cursor position and visibility.
+    /// Cursor snapshot (from terminal, updated by snapshotCells).
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
     cursor_visible: bool = true,
 
-    /// Alternate screen buffer (for vim, less, etc.). When on the alt
-    /// screen, `cells` points to the alt buffer and `alt_cells` holds
-    /// the saved main buffer (pointer-swapped, no memcpy).
-    alt_cells: ?[]Protocol.WireCell = null,
-    saved_main_cursor_x: u16 = 0,
-    saved_main_cursor_y: u16 = 0,
-    /// True when the alternate screen is active.
-    alt_screen_active: bool = false,
-
-    /// Saved cursor state (DECSC/DECRC, ESC 7/8).
-    saved_cursor_x: u16 = 0,
-    saved_cursor_y: u16 = 0,
-
-    /// Mode flags reported to clients.
-    bracketed_paste: bool = false,
-    application_cursor_keys: bool = false,
-
-    /// Dirty row tracking. One bit per row — set when cells change.
+    /// Dirty row tracking — set when snapshotCells detects changes.
     dirty_rows: std.DynamicBitSet,
-
-    /// Scrollback buffer — ring buffer of rows that scrolled off the top.
-    /// Each entry is a row of `cols` WireCells.
-    scrollback: std.ArrayListUnmanaged([]Protocol.WireCell),
-    scrollback_max: u32 = 10000,
 
     /// The PTY file descriptor (master side).
     pty_fd: ?posix.fd_t = null,
@@ -109,51 +93,146 @@ pub const DaemonSession = struct {
         self.alloc.free(self.pwd);
         self.alloc.free(self.command);
         self.alloc.free(self.cells);
-        if (self.alt_cells) |ac| self.alloc.free(ac);
         self.dirty_rows.deinit();
-        for (self.scrollback.items) |row| self.alloc.free(row);
-        self.scrollback.deinit(self.alloc);
+        self.terminal.deinit(self.alloc);
     }
 
-    /// Switch to alternate screen buffer (mode 1049). Pointer-swaps
-    /// cells <-> alt_cells so the main screen is preserved without memcpy.
-    pub fn switchToAltScreen(self: *DaemonSession) void {
-        if (self.alt_screen_active) return;
+    /// Feed PTY output through the terminal emulator and snapshot the
+    /// resulting cell grid into the wire-format cache.
+    pub fn feedAndSnapshot(self: *DaemonSession, data: []const u8) void {
+        var stream = self.terminal.vtStream();
+        stream.nextSlice(data);
+        self.snapshotCells();
+    }
 
-        const cell_count = @as(usize, self.rows) * @as(usize, self.cols);
+    /// Convert the terminal's screen to WireCell format, tracking dirty rows.
+    fn snapshotCells(self: *DaemonSession) void {
+        const screen = self.terminal.screens.active;
+        const cursor = screen.cursor;
 
-        // Allocate alt buffer if needed
-        if (self.alt_cells == null) {
-            self.alt_cells = self.alloc.alloc(Protocol.WireCell, cell_count) catch return;
+        self.cursor_x = cursor.x;
+        self.cursor_y = cursor.y;
+        self.cursor_visible = self.terminal.modes.get(.cursor_visible);
+
+        // Iterate visible rows
+        var row_it = screen.pages.rowIterator(
+            .right_down,
+            .{ .active = .{ .x = 0, .y = 0 } },
+            null,
+        );
+
+        var row_idx: u16 = 0;
+        while (row_it.next()) |pin| {
+            if (row_idx >= self.rows) break;
+
+            const term_cells = pin.cells(.all);
+            const row_start = @as(usize, row_idx) * @as(usize, self.cols);
+            var row_changed = false;
+
+            for (0..@min(term_cells.len, self.cols)) |col_idx| {
+                const wire = cellToWire(term_cells[col_idx], pin);
+                const idx = row_start + col_idx;
+                if (!std.meta.eql(self.cells[idx], wire)) {
+                    self.cells[idx] = wire;
+                    row_changed = true;
+                }
+            }
+
+            if (row_changed) self.dirty_rows.set(row_idx);
+            row_idx += 1;
         }
-        // Clear the alt buffer
-        @memset(self.alt_cells.?, Protocol.WireCell{});
-
-        // Save cursor and swap buffers
-        self.saved_main_cursor_x = self.cursor_x;
-        self.saved_main_cursor_y = self.cursor_y;
-        const tmp = self.cells;
-        self.cells = self.alt_cells.?;
-        self.alt_cells = tmp;
-        self.cursor_x = 0;
-        self.cursor_y = 0;
-        self.alt_screen_active = true;
-        self.markAllDirty();
     }
 
-    /// Switch back to main screen buffer (mode 1049 reset).
-    /// Pointer-swaps back so no memcpy needed.
-    pub fn switchToMainScreen(self: *DaemonSession) void {
-        if (!self.alt_screen_active) return;
+    /// Convert a terminal Cell to WireCell format.
+    fn cellToWire(cell: vt.Cell, pin: vt.Pin) Protocol.WireCell {
+        const cp: u32 = switch (cell.content_tag) {
+            .codepoint, .codepoint_grapheme => cell.content.codepoint,
+            else => 0,
+        };
 
-        // Swap back: cells (currently alt) <-> alt_cells (currently main)
-        const tmp = self.cells;
-        self.cells = self.alt_cells.?;
-        self.alt_cells = tmp;
-        self.cursor_x = self.saved_main_cursor_x;
-        self.cursor_y = self.saved_main_cursor_y;
-        self.alt_screen_active = false;
-        self.markAllDirty();
+        var fg_r: u8 = 255;
+        var fg_g: u8 = 255;
+        var fg_b: u8 = 255;
+        var bg_r: u8 = 0;
+        var bg_g: u8 = 0;
+        var bg_b: u8 = 0;
+        var flags: u8 = 0;
+
+        if (cell.style_id != 0) {
+            {
+                const style = pin.node.data.styles.get(pin.node.data.memory, cell.style_id);
+                switch (style.fg_color) {
+                    .none => {},
+                    .palette => |idx| {
+                        const rgb = paletteToRgb(idx);
+                        fg_r = rgb[0];
+                        fg_g = rgb[1];
+                        fg_b = rgb[2];
+                        flags |= 0x20;
+                    },
+                    .rgb => |rgb| {
+                        fg_r = rgb.r;
+                        fg_g = rgb.g;
+                        fg_b = rgb.b;
+                        flags |= 0x20;
+                    },
+                }
+                switch (style.bg_color) {
+                    .none => {},
+                    .palette => |idx| {
+                        const rgb = paletteToRgb(idx);
+                        bg_r = rgb[0];
+                        bg_g = rgb[1];
+                        bg_b = rgb[2];
+                        flags |= 0x40;
+                    },
+                    .rgb => |rgb| {
+                        bg_r = rgb.r;
+                        bg_g = rgb.g;
+                        bg_b = rgb.b;
+                        flags |= 0x40;
+                    },
+                }
+                if (style.flags.bold) flags |= 0x01;
+                if (style.flags.italic) flags |= 0x02;
+                if (style.flags.underline != .none) flags |= 0x04;
+                if (style.flags.strikethrough) flags |= 0x08;
+                if (style.flags.inverse) flags |= 0x10;
+            }
+        }
+
+        return .{
+            .codepoint = cp,
+            .fg_r = fg_r, .fg_g = fg_g, .fg_b = fg_b,
+            .bg_r = bg_r, .bg_g = bg_g, .bg_b = bg_b,
+            .style_flags = flags,
+            .wide = if (cell.wide == .wide) 1 else 0,
+        };
+    }
+
+    /// Convert a 256-color palette index to RGB.
+    fn paletteToRgb(idx: u8) [3]u8 {
+        // Standard 16 ANSI colors
+        const ansi = [16][3]u8{
+            .{ 0, 0, 0 },       .{ 205, 0, 0 },     .{ 0, 205, 0 },     .{ 205, 205, 0 },
+            .{ 0, 0, 238 },     .{ 205, 0, 205 },    .{ 0, 205, 205 },   .{ 229, 229, 229 },
+            .{ 127, 127, 127 }, .{ 255, 0, 0 },      .{ 0, 255, 0 },     .{ 255, 255, 0 },
+            .{ 92, 92, 255 },   .{ 255, 0, 255 },    .{ 0, 255, 255 },   .{ 255, 255, 255 },
+        };
+        if (idx < 16) return ansi[idx];
+        if (idx < 232) {
+            const ci = idx - 16;
+            const b_val = ci % 6;
+            const g_val = (ci / 6) % 6;
+            const r_val = ci / 36;
+            return .{
+                if (r_val == 0) 0 else @as(u8, @truncate(@as(u16, r_val) * 40 + 55)),
+                if (g_val == 0) 0 else @as(u8, @truncate(@as(u16, g_val) * 40 + 55)),
+                if (b_val == 0) 0 else @as(u8, @truncate(@as(u16, b_val) * 40 + 55)),
+            };
+        }
+        const gray: u8 = @truncate(@as(u16, idx - 232) * 10 + 8);
+        return .{ gray, gray, gray };
     }
 
     /// Mark all rows as dirty (e.g., after resize or new attach).
@@ -176,47 +255,6 @@ pub const DaemonSession = struct {
         const idx = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
         self.cells[idx] = cell;
         self.dirty_rows.set(row);
-    }
-
-    /// Push a row into the scrollback buffer (called before scroll-up).
-    /// Note: orderedRemove(0) is O(n) but acceptable for scrollback_max=10k
-    /// (~80KB pointer shift). A ring buffer would be O(1) but more complex.
-    pub fn pushScrollback(self: *DaemonSession, row_idx: usize) void {
-        const cols: usize = self.cols;
-
-        if (self.scrollback.items.len >= self.scrollback_max) {
-            // Evict oldest, reuse its allocation if same width
-            const evicted = self.scrollback.orderedRemove(0);
-            if (evicted.len == cols) {
-                @memcpy(evicted, self.cells[row_idx * cols ..][0..cols]);
-                self.scrollback.append(self.alloc, evicted) catch {
-                    self.alloc.free(evicted);
-                };
-                return;
-            }
-            self.alloc.free(evicted);
-        }
-
-        const row_copy = self.alloc.alloc(Protocol.WireCell, cols) catch return;
-        @memcpy(row_copy, self.cells[row_idx * cols ..][0..cols]);
-        self.scrollback.append(self.alloc, row_copy) catch {
-            self.alloc.free(row_copy);
-        };
-    }
-
-    /// Get scrollback rows. Returns a slice of row arrays.
-    /// offset=0 is the most recent scrollback row, offset=1 is the one before, etc.
-    pub fn getScrollbackRows(
-        self: *const DaemonSession,
-        offset: u32,
-        count: u32,
-    ) struct { rows: []const []Protocol.WireCell, start: usize } {
-        const total = self.scrollback.items.len;
-        if (total == 0 or offset >= total) return .{ .rows = &.{}, .start = 0 };
-        // Scrollback is stored oldest-first. Reverse index.
-        const end = total - offset;
-        const start = if (count > end) 0 else end - count;
-        return .{ .rows = self.scrollback.items[start..end], .start = start };
     }
 
     /// Serialize the full screen state (for FULL_STATE message).
@@ -378,9 +416,15 @@ pub fn createSession(
     var dirty = try std.DynamicBitSet.initFull(self.alloc, rows);
     errdefer dirty.deinit();
 
+    // Initialize the real Ghostty terminal emulator
+    var terminal = try vt.Terminal.init(self.alloc, .{
+        .cols = cols,
+        .rows = rows,
+    });
+    errdefer terminal.deinit(self.alloc);
+
     const session = try self.alloc.create(DaemonSession);
 
-    // dupeZ so the command is null-terminated for execve
     const cmd_copy: [:0]u8 = if (command) |cmd|
         try self.alloc.dupeZ(u8, cmd)
     else
@@ -394,9 +438,9 @@ pub fn createSession(
         .command = cmd_copy,
         .cols = cols,
         .rows = rows,
+        .terminal = terminal,
         .cells = cells,
         .dirty_rows = dirty,
-        .scrollback = .empty,
         .alloc = self.alloc,
     };
     // After session is fully initialized, use deinit for cleanup on error.
@@ -516,31 +560,23 @@ pub fn resizeSession(self: *SessionManager, session_id: u32, new_cols: u16, new_
         }
     }
 
-    // Resize the cell grid
+    // Resize the terminal emulator (handles reflow, etc.)
+    try session.terminal.resize(self.alloc, new_cols, new_rows);
+
+    // Resize the wire-format cache
     const new_count = @as(usize, new_rows) * @as(usize, new_cols);
     const new_cells = try self.alloc.alloc(Protocol.WireCell, new_count);
     @memset(new_cells, Protocol.WireCell{});
-
-    // Copy existing cells that fit — one memcpy per row
-    const copy_rows = @min(session.rows, new_rows);
-    const copy_cols: usize = @min(session.cols, new_cols);
-    for (0..copy_rows) |r| {
-        const dst_start = r * @as(usize, new_cols);
-        const src_start = r * @as(usize, session.cols);
-        @memcpy(
-            new_cells[dst_start..][0..copy_cols],
-            session.cells[src_start..][0..copy_cols],
-        );
-    }
-
     self.alloc.free(session.cells);
     session.cells = new_cells;
     session.cols = new_cols;
     session.rows = new_rows;
 
-    // Resize dirty bitset
     session.dirty_rows.deinit();
     session.dirty_rows = try std.DynamicBitSet.initFull(self.alloc, new_rows);
+
+    // Snapshot after resize to populate new cache
+    session.snapshotCells();
 }
 
 // ── PTY management ──

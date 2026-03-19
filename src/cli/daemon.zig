@@ -2,8 +2,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
-const Protocol = @import("../daemon/Protocol.zig");
-
 pub const default_socket = "/tmp/ghostty.sock";
 
 pub const Options = struct {};
@@ -63,18 +61,22 @@ pub fn getSocketPath() []const u8 {
     return std.posix.getenv("GHOSTTY_SOCKET") orelse default_socket;
 }
 
-pub fn isDaemonRunning(alloc: Allocator, socket_path: []const u8) bool {
+pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
     const addr = std.net.Address.initUnix(socket_path) catch return false;
     const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
     defer posix.close(fd);
     posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
 
-    // Send LIST_SESSIONS and check for valid response
-    const msg = Protocol.encodeEmpty(alloc, .list_sessions) catch return false;
-    defer alloc.free(msg);
-    Protocol.writeMessage(fd, msg) catch return false;
+    // GSP: magic('G','S') + type(LIST_SESSIONS=0x02) + length(0)
+    const probe = [_]u8{ 'G', 'S', 0x02, 0, 0, 0, 0 };
+    var sent: usize = 0;
+    while (sent < probe.len) {
+        const n = posix.write(fd, probe[sent..]) catch return false;
+        if (n == 0) return false;
+        sent += n;
+    }
 
-    var hdr: [Protocol.header_len]u8 = undefined;
+    var hdr: [7]u8 = undefined;
     var total: usize = 0;
     while (total < hdr.len) {
         const n = posix.read(fd, hdr[total..]) catch return false;
@@ -82,7 +84,7 @@ pub fn isDaemonRunning(alloc: Allocator, socket_path: []const u8) bool {
         total += n;
     }
 
-    return hdr[0] == Protocol.magic[0] and hdr[1] == Protocol.magic[1];
+    return hdr[0] == 'G' and hdr[1] == 'S';
 }
 
 fn startDaemon(socket_path: []const u8) !void {
@@ -120,20 +122,23 @@ fn startDaemon(socket_path: []const u8) !void {
         if (devnull > 2) _ = std.c.close(devnull);
     }
 
-    // Run daemon main loop directly (no exec needed)
-    const daemon_main = @import("../daemon/main.zig");
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-
-    const SessionManager = @import("../daemon/SessionManager.zig");
-    var session_mgr = SessionManager.init(alloc);
-
-    // Remove stale socket and start listening
-    std.fs.cwd().deleteFile(socket_path) catch {};
-    daemon_main.runUnixListener(alloc, socket_path, &session_mgr, "") catch {};
-
-    session_mgr.deinit();
-    std.c.exit(0);
+    // Exec the ghostty-daemon binary. It's a separate executable that
+    // handles its own socket setup, session management, and VT emulation.
+    const listen_arg: [:0]const u8 = std.fmt.bufPrintZ(
+        &@as([256]u8, undefined),
+        "unix:{s}",
+        .{socket_path},
+    ) catch {
+        std.c.exit(1);
+    };
+    const daemon_name: [*:0]const u8 = "ghostty-daemon";
+    const argv = [_:null]?[*:0]const u8{ daemon_name, "--listen", listen_arg.ptr };
+    _ = std.c.execve(daemon_name, &argv, std.c.environ);
+    // execve failed — try finding it via PATH
+    const path_daemon: [*:0]const u8 = "/usr/local/bin/ghostty-daemon";
+    const argv2 = [_:null]?[*:0]const u8{ path_daemon, "--listen", listen_arg.ptr };
+    _ = std.c.execve(path_daemon, &argv2, std.c.environ);
+    std.c.exit(1);
 }
 
 // ── Tests ──

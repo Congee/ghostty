@@ -5,7 +5,7 @@ const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
-const Protocol = @import("../daemon/Protocol.zig");
+const Protocol = @import("gsp");
 
 pub fn sessionList(
     alloc: Allocator,

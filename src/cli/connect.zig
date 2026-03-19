@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const crypto = std.crypto;
 
-const Protocol = @import("../daemon/Protocol.zig");
+const Protocol = @import("gsp");
 const cmds = @import("session_commands.zig");
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 

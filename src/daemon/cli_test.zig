@@ -2,7 +2,7 @@
 //! sessionCreate, sessionDestroy over socket pairs.
 const std = @import("std");
 const posix = std.posix;
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const SessionManager = @import("SessionManager.zig");
 const ClientConnection = @import("ClientConnection.zig");
 

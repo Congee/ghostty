@@ -9,7 +9,7 @@
 const VtParser = @This();
 
 const std = @import("std");
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const SessionManager = @import("SessionManager.zig");
 
 const log = std.log.scoped(.vt_parser);

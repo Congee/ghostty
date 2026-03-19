@@ -84,8 +84,14 @@ pub fn build(b: *std.Build) !void {
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
 
-    // Ghostty daemon — standalone session server (no renderer dependencies).
-    const daemon = try buildpkg.GhosttyDaemon.init(b, &config);
+    // GSP protocol module (shared between exe CLI commands and daemon)
+    const gsp_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/gsp.zig"),
+    });
+    exe.exe.root_module.addImport("gsp", gsp_mod);
+
+    // Ghostty daemon — standalone session server with libghostty-vt terminal emulation.
+    const daemon = try buildpkg.GhosttyDaemon.init(b, &config, mod.vt, gsp_mod);
     daemon_step.dependOn(&daemon.install_step.step);
 
     // Ghostty docs

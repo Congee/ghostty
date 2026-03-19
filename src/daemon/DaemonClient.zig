@@ -17,7 +17,7 @@ const std = @import("std");
 const posix = std.posix;
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 
 const log = std.log.scoped(.daemon_client);

@@ -1,6 +1,5 @@
 /// Build configuration for the ghostty-daemon standalone executable.
-/// The daemon is intentionally lightweight — it only needs libc for
-/// PTY operations and does not depend on SharedDeps (no fonts, renderers, etc.).
+/// Uses the pre-built vt module from GhosttyZig for terminal emulation.
 const GhosttyDaemon = @This();
 
 const std = @import("std");
@@ -13,7 +12,12 @@ exe: *std.Build.Step.Compile,
 /// The install step for the executable.
 install_step: *std.Build.Step.InstallArtifact,
 
-pub fn init(b: *std.Build, cfg: *const Config) !GhosttyDaemon {
+pub fn init(
+    b: *std.Build,
+    cfg: *const Config,
+    vt_mod: *std.Build.Module,
+    gsp_mod: *std.Build.Module,
+) !GhosttyDaemon {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
         .name = "ghostty-daemon",
         .root_module = b.createModule(.{
@@ -34,6 +38,12 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyDaemon {
     if (cfg.target.result.os.tag.isDarwin()) {
         try @import("apple_sdk").addPaths(b, exe);
     }
+
+    // Add the pre-built terminal module for full VT emulation
+    exe.root_module.addImport("vt", vt_mod);
+
+    // Add the GSP protocol module (shared with main exe CLI)
+    exe.root_module.addImport("gsp", gsp_mod);
 
     const install_step = b.addInstallArtifact(exe, .{});
 

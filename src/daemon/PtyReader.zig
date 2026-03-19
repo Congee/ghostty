@@ -1,14 +1,13 @@
-//! Reads output from a session's PTY, parses VT sequences to update the
-//! cell grid, and pushes delta updates to the attached client. One PtyReader
-//! runs per active session in its own thread.
+//! Reads output from a session's PTY, feeds it through the Ghostty
+//! terminal emulator, and pushes delta updates to the attached client.
+//! One PtyReader runs per active session in its own thread.
 const PtyReader = @This();
 
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const SessionManager = @import("SessionManager.zig");
-const VtParser = @import("VtParser.zig");
 
 const log = std.log.scoped(.pty_reader);
 
@@ -71,10 +70,8 @@ fn readLoop(self: *PtyReader) void {
         log.err("session {} has no pty", .{self.session_id});
         return;
     };
-    const rows = session.rows;
     self.session_mgr.unlock();
 
-    var parser = VtParser.init(rows);
     var buf: [4096]u8 = undefined;
 
     while (self.running.load(.acquire)) {
@@ -119,14 +116,14 @@ fn readLoop(self: *PtyReader) void {
             break;
         }
 
-        // Parse VT output under lock, serialize delta, then release lock
-        // before doing blocking socket I/O to avoid deadlock.
+        // Feed through terminal emulator, snapshot cells, serialize delta
+        // — all under lock. Send outside lock to avoid deadlock.
         var delta_payload: ?[]u8 = null;
         var delta_fd: posix.fd_t = -1;
 
         self.session_mgr.lock();
         if (self.session_mgr.getSession(self.session_id)) |s| {
-            parser.feed(s, buf[0..n]);
+            s.feedAndSnapshot(buf[0..n]);
 
             const cfd = self.client_fd.load(.acquire);
             if (cfd >= 0) {

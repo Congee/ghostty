@@ -7,7 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
-const Protocol = @import("Protocol.zig");
+const Protocol = @import("gsp");
 const SessionManager = @import("SessionManager.zig");
 const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
 
@@ -320,72 +320,10 @@ fn handleDestroy(self: *ClientConnection, payload: []const u8) !void {
 }
 
 fn handleScroll(self: *ClientConnection, payload: []const u8) !void {
-    if (payload.len < 8) {
-        try self.sendError("invalid scroll payload");
-        return;
-    }
-
-    const session_id = self.attached_session_id orelse {
-        try self.sendError("not attached");
-        return;
-    };
-
-    const offset = std.mem.readInt(u32, payload[0..4], .little);
-    const count = std.mem.readInt(u32, payload[4..8], .little);
-    if (count == 0 or count > 1000) {
-        try self.sendError("invalid scroll count");
-        return;
-    }
-
-    // Serialize scrollback data while holding the lock to prevent
-    // use-after-free if PtyReader reallocates scrollback concurrently.
-    self.session_mgr.lock();
-    const resp_payload = blk: {
-        const session = self.session_mgr.getSession(session_id) orelse {
-            self.session_mgr.unlock();
-            try self.sendError("session not found");
-            return;
-        };
-
-        const result = session.getScrollbackRows(offset, count);
-        const rows = result.rows;
-        const cols: usize = session.cols;
-
-        if (rows.len == 0) {
-            self.session_mgr.unlock();
-            try self.sendEmpty(.scroll_data);
-            return;
-        }
-
-        // Serialize: num_rows(4) + offset(4) + cols(2) + [rows * cols * WireCell]
-        const hdr_size: usize = 10;
-        const resp_size = hdr_size + rows.len * cols * Protocol.WireCell.size;
-        const resp = self.alloc.alloc(u8, resp_size) catch |err| {
-            self.session_mgr.unlock();
-            return err;
-        };
-
-        std.mem.writeInt(u32, resp[0..4], @intCast(rows.len), .little);
-        std.mem.writeInt(u32, resp[4..8], offset, .little);
-        std.mem.writeInt(u16, resp[8..10], @intCast(cols), .little);
-
-        var write_offset: usize = hdr_size;
-        for (rows) |row| {
-            const row_bytes: [*]const u8 = @ptrCast(row.ptr);
-            @memcpy(
-                resp[write_offset..][0 .. cols * Protocol.WireCell.size],
-                row_bytes[0 .. cols * Protocol.WireCell.size],
-            );
-            write_offset += cols * Protocol.WireCell.size;
-        }
-        break :blk resp;
-    };
-    self.session_mgr.unlock();
-    defer self.alloc.free(resp_payload);
-
-    const encoded = try Protocol.encode(self.alloc, .scroll_data, resp_payload);
-    defer self.alloc.free(encoded);
-    try Protocol.writeMessage(self.fd, encoded);
+    _ = payload;
+    // Scrollback is managed by the terminal emulator internally.
+    // TODO: implement scrollback serialization from terminal.PageList
+    try self.sendEmpty(.scroll_data);
 }
 
 // ── Helpers ──

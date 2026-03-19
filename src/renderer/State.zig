@@ -30,6 +30,11 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Status bar state. When set, a status bar is rendered at the bottom
+/// of the terminal using one row of reserved padding. Updated via
+/// Surface.setStatusBar() or the control socket.
+status_bar: ?StatusBar = null,
+
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use
     /// viewport points to avoid the complexity of mapping the mouse to
@@ -118,6 +123,129 @@ pub const Preedit = struct {
             .start = start -| start_offset,
             .end = end -| start_offset,
             .cp_offset = cp_offset,
+        };
+    }
+};
+
+/// A styled, optionally clickable segment in the status bar.
+pub const Component = struct {
+    /// The text to display.
+    text: []const u8,
+
+    /// Visual style for this segment.
+    style: ComponentStyle = .{},
+
+    /// Click handler. If set, this segment is clickable.
+    click: ?ClickAction = null,
+
+    pub const ComponentStyle = struct {
+        fg: ?[3]u8 = null, // RGB
+        bg: ?[3]u8 = null, // RGB
+        bold: bool = false,
+        italic: bool = false,
+        underline: bool = false,
+        strikethrough: bool = false,
+    };
+
+    pub const ClickAction = struct {
+        /// Unique ID within the source, used for hit testing and notifications.
+        id: []const u8,
+        /// What to do on click.
+        action: Action,
+
+        pub const Action = union(enum) {
+            /// Push CLICK event back to the source's subscribed socket.
+            notify,
+            /// Execute a ghostty keybind action string.
+            key: []const u8,
+            /// Run a shell command.
+            cmd: []const u8,
+        };
+    };
+
+    pub fn deinit(self: *const Component, alloc: Allocator) void {
+        alloc.free(self.text);
+        if (self.click) |cl| {
+            alloc.free(cl.id);
+            switch (cl.action) {
+                .notify => {},
+                .key => |k| alloc.free(k),
+                .cmd => |c| alloc.free(c),
+            }
+        }
+    }
+
+    pub fn clone(self: *const Component, alloc: Allocator) !Component {
+        return .{
+            .text = try alloc.dupe(u8, self.text),
+            .style = self.style,
+            .click = if (self.click) |cl| .{
+                .id = try alloc.dupe(u8, cl.id),
+                .action = switch (cl.action) {
+                    .notify => .notify,
+                    .key => |k| .{ .key = try alloc.dupe(u8, k) },
+                    .cmd => |c| .{ .cmd = try alloc.dupe(u8, c) },
+                },
+            } else null,
+        };
+    }
+};
+
+/// A region in the status bar that is clickable, computed during render.
+pub const ClickRegion = struct {
+    x_start: u16,
+    x_end: u16,
+    click_id: []const u8,
+    source_id: []const u8,
+    action: Component.ClickAction.Action,
+};
+
+/// Status bar content for rendering in the reserved bottom padding area.
+/// Layout: [left_components] [tabs (native)] [right_components]
+pub const StatusBar = struct {
+    /// Plain text fallback (for backward compat with SET-STATUS-LEFT/RIGHT).
+    left: []const u8 = "",
+    right: []const u8 = "",
+
+    /// Styled components from external programs (SET-COMPONENTS).
+    left_components: []const Component = &.{},
+    right_components: []const Component = &.{},
+
+    /// Source IDs for component ownership tracking.
+    left_source: []const u8 = "",
+    right_source: []const u8 = "",
+
+    /// Click regions computed during the last render pass.
+    click_regions: []const ClickRegion = &.{},
+
+    pub fn deinit(self: *const StatusBar, alloc: Allocator) void {
+        if (self.left.len > 0) alloc.free(self.left);
+        if (self.right.len > 0) alloc.free(self.right);
+        for (self.left_components) |*comp| comp.deinit(alloc);
+        if (self.left_components.len > 0) alloc.free(self.left_components);
+        for (self.right_components) |*comp| comp.deinit(alloc);
+        if (self.right_components.len > 0) alloc.free(self.right_components);
+        if (self.left_source.len > 0) alloc.free(self.left_source);
+        if (self.right_source.len > 0) alloc.free(self.right_source);
+        if (self.click_regions.len > 0) alloc.free(self.click_regions);
+    }
+
+    pub fn clone(self: *const StatusBar, alloc: Allocator) !StatusBar {
+        var left_comps = try alloc.alloc(Component, self.left_components.len);
+        for (self.left_components, 0..) |*comp, i| {
+            left_comps[i] = try comp.clone(alloc);
+        }
+        var right_comps = try alloc.alloc(Component, self.right_components.len);
+        for (self.right_components, 0..) |*comp, i| {
+            right_comps[i] = try comp.clone(alloc);
+        }
+        return .{
+            .left = if (self.left.len > 0) try alloc.dupe(u8, self.left) else "",
+            .right = if (self.right.len > 0) try alloc.dupe(u8, self.right) else "",
+            .left_components = left_comps,
+            .right_components = right_comps,
+            .left_source = if (self.left_source.len > 0) try alloc.dupe(u8, self.left_source) else "",
+            .right_source = if (self.right_source.len > 0) try alloc.dupe(u8, self.right_source) else "",
         };
     }
 };

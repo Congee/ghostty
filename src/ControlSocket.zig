@@ -21,6 +21,8 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Surface = @import("Surface.zig");
 const App = @import("App.zig");
+const renderer = @import("renderer.zig");
+const Component = renderer.State.Component;
 
 const log = std.log.scoped(.control_socket);
 
@@ -192,6 +194,24 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         return self.getFocused(resp_buf);
     }
 
+    if (std.mem.startsWith(u8, line, "SET-COMPONENTS ")) {
+        const json = line["SET-COMPONENTS ".len..];
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        const components = parseComponents(self.alloc, json) catch return "ERR invalid JSON\n";
+        surface.setComponents(components.zone, components.source, components.items) catch {
+            freeComponents(self.alloc, components.items);
+            return "ERR failed to set components\n";
+        };
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "CLEAR-COMPONENTS ")) {
+        const source = line["CLEAR-COMPONENTS ".len..];
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        surface.clearComponents(source) catch {};
+        return "OK\n";
+    }
+
     if (std.mem.startsWith(u8, line, "RENAME-TAB ")) {
         const name = line["RENAME-TAB ".len..];
         const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
@@ -271,4 +291,92 @@ fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
         self.app.surfaces.items.len,
     }) catch return "ERR buffer overflow\n";
     return fbs.getWritten();
+}
+
+// ── JSON Component Parsing ──
+
+const ParsedComponents = struct {
+    zone: []const u8,
+    source: []const u8,
+    items: []Component,
+};
+
+fn parseComponents(alloc: Allocator, json: []const u8) !ParsedComponents {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const zone = (root.get("zone") orelse return error.MissingField).string;
+    const source = (root.get("source") orelse return error.MissingField).string;
+    const comps_arr = (root.get("components") orelse return error.MissingField).array;
+
+    var items = try alloc.alloc(Component, comps_arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*c| c.deinit(alloc);
+        alloc.free(items);
+    }
+
+    for (comps_arr.items, 0..) |item, i| {
+        items[i] = try parseOneComponent(alloc, item);
+        initialized += 1;
+    }
+
+    return .{
+        .zone = try alloc.dupe(u8, zone),
+        .source = try alloc.dupe(u8, source),
+        .items = items,
+    };
+}
+
+fn parseOneComponent(alloc: Allocator, val: std.json.Value) !Component {
+    const obj = val.object;
+    const text = try alloc.dupe(u8, (obj.get("text") orelse return error.MissingField).string);
+    errdefer alloc.free(text);
+
+    var style: Component.ComponentStyle = .{};
+    if (obj.get("style")) |style_val| {
+        const so = style_val.object;
+        if (so.get("fg")) |fg| style.fg = parseHexColor(fg.string);
+        if (so.get("bg")) |bg| style.bg = parseHexColor(bg.string);
+        if (so.get("bold")) |b| style.bold = b.bool;
+        if (so.get("italic")) |b| style.italic = b.bool;
+        if (so.get("underline")) |b| style.underline = b.bool;
+        if (so.get("strikethrough")) |b| style.strikethrough = b.bool;
+    }
+
+    var click: ?Component.ClickAction = null;
+    if (obj.get("click")) |click_val| {
+        const co = click_val.object;
+        const id = try alloc.dupe(u8, (co.get("id") orelse return error.MissingField).string);
+        errdefer alloc.free(id);
+        const action_str = (co.get("action") orelse return error.MissingField).string;
+
+        const action: Component.ClickAction.Action = if (std.mem.eql(u8, action_str, "notify"))
+            .notify
+        else if (std.mem.startsWith(u8, action_str, "key:"))
+            .{ .key = try alloc.dupe(u8, action_str["key:".len..]) }
+        else if (std.mem.startsWith(u8, action_str, "cmd:"))
+            .{ .cmd = try alloc.dupe(u8, action_str["cmd:".len..]) }
+        else
+            .notify;
+
+        click = .{ .id = id, .action = action };
+    }
+
+    return .{ .text = text, .style = style, .click = click };
+}
+
+fn parseHexColor(s: []const u8) ?[3]u8 {
+    if (s.len != 7 or s[0] != '#') return null;
+    return .{
+        std.fmt.parseInt(u8, s[1..3], 16) catch return null,
+        std.fmt.parseInt(u8, s[3..5], 16) catch return null,
+        std.fmt.parseInt(u8, s[5..7], 16) catch return null,
+    };
+}
+
+fn freeComponents(alloc: Allocator, items: []Component) void {
+    for (items) |*c| c.deinit(alloc);
+    alloc.free(items);
 }

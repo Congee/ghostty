@@ -2568,6 +2568,76 @@ pub fn setStatusBar(self: *Surface, left: ?[]const u8, right: ?[]const u8) !void
     try self.queueRender();
 }
 
+/// Set styled components for a status bar zone (left or right).
+/// Components are rendered with per-segment colors and click regions.
+pub fn setComponents(
+    self: *Surface,
+    zone: []const u8,
+    source: []const u8,
+    components: []const rendererpkg.State.Component,
+) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // Ensure status bar exists
+    if (self.renderer_state.status_bar == null) {
+        self.renderer_state.status_bar = .{};
+    }
+    var sb = &self.renderer_state.status_bar.?;
+
+    const is_left = std.mem.eql(u8, zone, "left");
+
+    // Free old components for this zone
+    const old_comps = if (is_left) sb.left_components else sb.right_components;
+    for (old_comps) |*c| c.deinit(self.alloc);
+    if (old_comps.len > 0) self.alloc.free(old_comps);
+
+    const old_source = if (is_left) sb.left_source else sb.right_source;
+    if (old_source.len > 0) self.alloc.free(old_source);
+
+    // Clone and store new components
+    var new_comps = try self.alloc.alloc(rendererpkg.State.Component, components.len);
+    for (components, 0..) |*comp, i| {
+        new_comps[i] = try comp.clone(self.alloc);
+    }
+    const new_source = try self.alloc.dupe(u8, source);
+
+    if (is_left) {
+        sb.left_components = new_comps;
+        sb.left_source = new_source;
+    } else {
+        sb.right_components = new_comps;
+        sb.right_source = new_source;
+    }
+
+    try self.queueRender();
+}
+
+/// Clear all components from a given source.
+pub fn clearComponents(self: *Surface, source: []const u8) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    var sb = &(self.renderer_state.status_bar orelse return);
+
+    if (std.mem.eql(u8, sb.left_source, source)) {
+        for (sb.left_components) |*c| c.deinit(self.alloc);
+        if (sb.left_components.len > 0) self.alloc.free(sb.left_components);
+        sb.left_components = &.{};
+        self.alloc.free(sb.left_source);
+        sb.left_source = "";
+    }
+    if (std.mem.eql(u8, sb.right_source, source)) {
+        for (sb.right_components) |*c| c.deinit(self.alloc);
+        if (sb.right_components.len > 0) self.alloc.free(sb.right_components);
+        sb.right_components = &.{};
+        self.alloc.free(sb.right_source);
+        sb.right_source = "";
+    }
+
+    try self.queueRender();
+}
+
 /// Refresh the status bar using the built-in StatusBarWidget. Called when
 /// tabs change, focus changes, or a tab is renamed. Uses the App's surface
 /// list to populate the {tabs} widget.

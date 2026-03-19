@@ -4773,6 +4773,7 @@ pub fn finalize(self: *Config) !void {
             ">seven=goto_tab:7",
             ">eight=goto_tab:8",
             ">nine=goto_tab:9",
+            ">comma=prompt_tab_title",
         };
         for (&suffixes) |suffix| {
             const bind = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
@@ -4783,6 +4784,13 @@ pub fn finalize(self: *Config) !void {
                 },
             };
         }
+    }
+
+    // When the status bar is enabled, auto-hide the native title bar and
+    // tab bar to provide a clean tmux-like experience. Users who explicitly
+    // set these options will have their values overridden.
+    if (self.@"status-bar") {
+        self.@"window-show-tab-bar" = .never;
     }
 }
 

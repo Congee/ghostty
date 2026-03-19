@@ -122,23 +122,19 @@ fn startDaemon(socket_path: []const u8) !void {
         if (devnull > 2) _ = std.c.close(devnull);
     }
 
-    // Exec the ghostty-daemon binary. It's a separate executable that
-    // handles its own socket setup, session management, and VT emulation.
-    const listen_arg: [:0]const u8 = std.fmt.bufPrintZ(
-        &@as([256]u8, undefined),
-        "unix:{s}",
-        .{socket_path},
-    ) catch {
-        std.c.exit(1);
-    };
-    const daemon_name: [*:0]const u8 = "ghostty-daemon";
-    const argv = [_:null]?[*:0]const u8{ daemon_name, "--listen", listen_arg.ptr };
-    _ = std.c.execve(daemon_name, &argv, std.c.environ);
-    // execve failed — try finding it via PATH
-    const path_daemon: [*:0]const u8 = "/usr/local/bin/ghostty-daemon";
-    const argv2 = [_:null]?[*:0]const u8{ path_daemon, "--listen", listen_arg.ptr };
-    _ = std.c.execve(path_daemon, &argv2, std.c.environ);
-    std.c.exit(1);
+    // Run daemon main loop in-process (same binary, forked grandchild)
+    const daemon_main = @import("../daemon/main.zig");
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc2 = gpa.allocator();
+
+    const SessionManager = @import("../daemon/SessionManager.zig");
+    var session_mgr = SessionManager.init(alloc2);
+
+    std.fs.cwd().deleteFile(socket_path) catch {};
+    daemon_main.runUnixListener(alloc2, socket_path, &session_mgr, "") catch {};
+
+    session_mgr.deinit();
+    std.c.exit(0);
 }
 
 // ── Tests ──

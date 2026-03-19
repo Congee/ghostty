@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = b.path("pkg/gsp.zig"),
     });
     exe.exe.root_module.addImport("gsp", gsp_mod);
+    exe.exe.root_module.addImport("vt", mod.vt);
 
     // Ghostty daemon — standalone session server with libghostty-vt terminal emulation.
     const daemon = try buildpkg.GhosttyDaemon.init(b, &config, mod.vt, gsp_mod);

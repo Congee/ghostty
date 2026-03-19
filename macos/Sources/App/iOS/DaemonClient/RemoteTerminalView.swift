@@ -1,3 +1,4 @@
+#if os(iOS)
 // RemoteTerminalView — SwiftUI view that renders the daemon's cell grid.
 // Uses a Canvas for efficient character rendering.
 
@@ -88,3 +89,4 @@ struct RemoteTerminalView: View {
         .background(.black)
     }
 }
+#endif

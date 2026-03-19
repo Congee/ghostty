@@ -1,3 +1,4 @@
+#if os(iOS)
 // DaemonConnectionView — iOS UI for connecting to a ghostty-daemon,
 // picking a session, and interacting with the remote terminal.
 
@@ -211,3 +212,4 @@ struct DaemonConnectionView: View {
 #Preview {
     DaemonConnectionView()
 }
+#endif

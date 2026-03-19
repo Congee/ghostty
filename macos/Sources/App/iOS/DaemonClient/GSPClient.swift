@@ -1,3 +1,4 @@
+#if os(iOS)
 // GSPClient — Swift implementation of the GSP (Ghostty Sync Protocol) client.
 // Connects to a ghostty-daemon over TCP or Unix socket, handles auth,
 // and provides async session management.
@@ -509,3 +510,4 @@ class GSPClient: ObservableObject {
         #endif
     }
 }
+#endif

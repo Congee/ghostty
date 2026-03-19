@@ -2638,57 +2638,120 @@ pub fn clearComponents(self: *Surface, source: []const u8) !void {
     try self.queueRender();
 }
 
-/// Refresh the status bar using the built-in StatusBarWidget. Called when
-/// tabs change, focus changes, or a tab is renamed. Uses the App's surface
-/// list to populate the {tabs} widget.
+/// Refresh the status bar by writing styled content directly into the
+/// terminal's last row via VT escape sequences. The terminal renders
+/// these as normal cells — no custom renderer needed (tmux model).
 ///
-/// Performance: renders to temp buffers and compares against the current
-/// status bar content. Only calls setStatusBar (which allocates + triggers
-/// a render) when the content has actually changed.
+/// Layout: [left_components] [tabs] [right_components]
+/// The shell's scrolling region excludes the last row (DECSTBM).
 pub fn refreshStatusBar(self: *Surface) !void {
     if (!self.config.status_bar_enabled) return;
 
-    const StatusBarWidget = @import("StatusBarWidget.zig");
+    // Build VT escape sequence buffer
+    var buf = std.ArrayList(u8).init(self.alloc);
+    defer buf.deinit();
+    const w = buf.writer();
 
-    // Build tab info from the app's surface list
-    const surfaces = self.app.surfaces.items;
-    const tab_infos = try self.alloc.alloc(StatusBarWidget.TabInfo, surfaces.len);
-    defer self.alloc.free(tab_infos);
+    // Get terminal dimensions
+    const t = self.renderer_state.terminal;
+    const rows = t.screens.active.pages.rows;
+    const cols = t.screens.active.pages.cols;
+    if (rows < 2 or cols < 10) return;
 
-    for (surfaces, 0..) |surf, i| {
-        const core_surface: *Surface = &surf.core_surface;
-        const label = core_surface.session.displayLabel();
-        tab_infos[i] = .{
-            .index = @intCast(i),
-            .label = label,
-            .is_active = (core_surface == self),
-        };
-    }
+    const status_row = rows; // 1-based, last row
 
-    const widget = StatusBarWidget.init(self.alloc, null, null);
-    const ctx: StatusBarWidget.Context = .{
-        .session = self.session,
-        .tabs = tab_infos,
-    };
+    // Save cursor + set scrolling region to exclude last row
+    try w.writeAll("\x1b7"); // DECSC
+    try w.print("\x1b[1;{d}r", .{rows - 1}); // DECSTBM: scroll region = 1..N-1
 
-    const left = try widget.renderLeft(ctx);
-    defer self.alloc.free(left);
-    const right = try widget.renderRight(ctx);
-    defer self.alloc.free(right);
+    // Move to status bar row, clear it
+    try w.print("\x1b[{d};1H", .{status_row}); // CUP to last row
+    try w.writeAll("\x1b[0m"); // Reset attributes
+    try w.writeAll("\x1b[7m"); // Reverse video for status bar background
+    try w.writeAll("\x1b[K"); // Clear line
 
-    // Only update if content changed (avoid allocation + render churn)
+    // Write left components
     {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
 
         if (self.renderer_state.status_bar) |sb| {
-            if (std.mem.eql(u8, sb.left, left) and std.mem.eql(u8, sb.right, right)) {
-                return; // No change — skip update
+            for (sb.left_components) |comp| {
+                try writeComponentEsc(w, comp);
             }
         }
     }
 
-    try self.setStatusBar(left, right);
+    // Write tabs in the middle
+    try w.writeAll("\x1b[0m\x1b[7m"); // Reset to reverse video
+    const surfaces = self.app.surfaces.items;
+    for (surfaces, 0..) |surf, i| {
+        const core_surface: *Surface = &surf.core_surface;
+        const label = core_surface.session.displayLabel();
+        const is_active = (core_surface == self);
+
+        if (is_active) {
+            try w.writeAll("\x1b[1m"); // Bold for active tab
+        }
+        try w.print(" {d}:{s}", .{ i, label });
+        if (is_active) {
+            try w.writeAll("*\x1b[22m"); // Unbold
+        }
+    }
+
+    // Write right components (right-aligned)
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        if (self.renderer_state.status_bar) |sb| {
+            if (sb.right_components.len > 0) {
+                // Calculate total width of right components
+                var right_width: usize = 0;
+                for (sb.right_components) |comp| {
+                    right_width += comp.text.len;
+                }
+                // Position cursor for right-aligned content
+                if (right_width < cols) {
+                    try w.print("\x1b[{d};{d}H", .{ status_row, cols - right_width + 1 });
+                }
+                for (sb.right_components) |comp| {
+                    try writeComponentEsc(w, comp);
+                }
+            }
+        }
+    }
+
+    // Restore cursor + attributes
+    try w.writeAll("\x1b[0m"); // Reset attributes
+    try w.writeAll("\x1b8"); // DECRC
+
+    // Feed the escape sequences into the terminal
+    var stream = t.vtStream();
+    stream.nextSlice(buf.items);
+
+    try self.queueRender();
+}
+
+/// Write a Component as VT escape sequences (SGR colors + text).
+fn writeComponentEsc(w: anytype, comp: rendererpkg.State.Component) !void {
+    // Set style
+    if (comp.style.fg) |fg| {
+        try w.print("\x1b[38;2;{d};{d};{d}m", .{ fg[0], fg[1], fg[2] });
+    }
+    if (comp.style.bg) |bg| {
+        try w.print("\x1b[48;2;{d};{d};{d}m", .{ bg[0], bg[1], bg[2] });
+    }
+    if (comp.style.bold) try w.writeAll("\x1b[1m");
+    if (comp.style.italic) try w.writeAll("\x1b[3m");
+    if (comp.style.underline) try w.writeAll("\x1b[4m");
+    if (comp.style.strikethrough) try w.writeAll("\x1b[9m");
+
+    // Write text
+    try w.writeAll(comp.text);
+
+    // Reset after component
+    try w.writeAll("\x1b[0m\x1b[7m"); // Reset + re-enable reverse video
 }
 
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {

@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) !void {
 
     // All our steps which we'll hook up later. The steps are shown
     // up here just so that they are more self-documenting.
+    const daemon_step = b.step("daemon", "Build ghostty-daemon");
     const run_step = b.step("run", "Run the app");
     const run_valgrind_step = b.step(
         "run-valgrind",
@@ -82,6 +83,10 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty executable, the actual runnable Ghostty program.
     const exe = try buildpkg.GhosttyExe.init(b, &config, &deps);
+
+    // Ghostty daemon — standalone session server (no renderer dependencies).
+    const daemon = try buildpkg.GhosttyDaemon.init(b, &config);
+    daemon_step.dependOn(&daemon.install_step.step);
 
     // Ghostty docs
     const docs = try buildpkg.GhosttyDocs.init(b, &deps);

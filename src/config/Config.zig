@@ -1869,6 +1869,63 @@ class: ?[:0]const u8 = null,
 /// Key tables are available since Ghostty 1.3.0.
 keybind: Keybinds = .{},
 
+/// The prefix key for tmux-style key bindings. This key must be pressed
+/// before session management shortcuts like detach (d), new tab (c),
+/// next tab (n), etc.
+///
+/// Set to "none" to disable prefix key bindings entirely.
+///
+/// The value uses the same key format as keybind triggers (e.g.
+/// "ctrl+b", "ctrl+a", "super+b").
+///
+/// Default: ctrl+b
+@"prefix-key": []const u8 = "ctrl+b",
+
+/// Enable the status bar at the bottom of the terminal.
+/// When enabled, one row at the bottom is reserved for status information.
+/// The status bar content can be updated externally via the control
+/// socket (see control-socket) or any tool that speaks the protocol.
+/// The socket path is exported as $GHOSTTY_SOCKET in child processes.
+///
+/// Default: false
+@"status-bar": bool = false,
+
+/// Path to the Unix socket for the control interface.
+/// External tools can connect to this socket to update the status bar,
+/// list sessions, etc. If not set, defaults to
+/// /tmp/ghostty-ctl-<pid>.sock.
+///
+/// Default: (auto)
+@"control-socket": ?[]const u8 = null,
+
+/// Address for the ghostty-daemon to listen on. The daemon manages
+/// persistent terminal sessions that survive app restarts.
+///
+/// Formats:
+///   unix:/path/to/socket — Unix domain socket (recommended for local use)
+///   tcp:host:port — TCP socket (for remote access via Tailscale etc.)
+///
+/// Default: (none — daemon mode disabled)
+@"daemon-socket": ?[]const u8 = null,
+
+/// Connect to an existing ghostty-daemon instead of running a local
+/// terminal. When set, Ghostty acts as a thin client: it sends input
+/// and receives rendered cell data from the daemon.
+///
+/// Formats:
+///   unix:/path/to/socket — Connect via Unix domain socket
+///   tcp:host:port — Connect via TCP (for remote access)
+///
+/// Default: (none — local terminal mode)
+@"daemon-connect": ?[]const u8 = null,
+
+/// Pre-shared authentication key for daemon connections. Required when
+/// connecting to a daemon over TCP. The same key must be configured on
+/// both the daemon (--auth-key) and the client.
+///
+/// Default: (none — no authentication)
+@"daemon-auth-key": ?[]const u8 = null,
+
 /// Remap modifier keys within Ghostty. This allows you to swap or reassign
 /// modifier keys at the application level without affecting system-wide
 /// settings.
@@ -4687,6 +4744,46 @@ pub fn finalize(self: *Config) !void {
 
     // Finalize key remapping set for efficient lookups
     self.@"key-remap".finalize();
+
+    // Generate tmux-style prefix key bindings based on the configured
+    // prefix key. Skip if set to "none".
+    if (!std.mem.eql(u8, self.@"prefix-key", "none")) {
+        const prefix = self.@"prefix-key";
+        const suffixes = [_][]const u8{
+            ">d=detach_session",
+            ">a=reattach_session",
+            ">s=list_sessions",
+            ">c=new_tab",
+            ">n=next_tab",
+            ">p=previous_tab",
+            ">shift+five=new_split:right",
+            ">shift+apostrophe=new_split:down",
+            ">x=close_surface",
+            ">z=toggle_split_zoom",
+            ">arrow_left=goto_split:left",
+            ">arrow_right=goto_split:right",
+            ">arrow_up=goto_split:up",
+            ">arrow_down=goto_split:down",
+            ">one=goto_tab:1",
+            ">two=goto_tab:2",
+            ">three=goto_tab:3",
+            ">four=goto_tab:4",
+            ">five=goto_tab:5",
+            ">six=goto_tab:6",
+            ">seven=goto_tab:7",
+            ">eight=goto_tab:8",
+            ">nine=goto_tab:9",
+        };
+        for (&suffixes) |suffix| {
+            const bind = try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, suffix });
+            self.keybind.set.parseAndPut(alloc, bind) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("invalid prefix-key binding: {s}{s} err={}", .{ prefix, suffix, err });
+                },
+            };
+        }
+    }
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
@@ -7169,6 +7266,7 @@ pub const Keybinds = struct {
                 .{ .esc = "f" },
             );
         }
+
     }
 
     pub fn parseCLI(self: *Keybinds, alloc: Allocator, input: ?[]const u8) !void {

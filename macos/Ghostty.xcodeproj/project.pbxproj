@@ -99,6 +99,9 @@
 		8193245D2F24E80800A9ED8F /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				App/iOS/DaemonClient/DaemonConnectionView.swift,
+				App/iOS/DaemonClient/GSPClient.swift,
+				App/iOS/DaemonClient/RemoteTerminalView.swift,
 				"Features/Custom App Icon/AppIcon.swift",
 				"Features/Custom App Icon/ColorizedGhosttyIcon.swift",
 				"Features/Custom App Icon/DockTilePlugin.swift",
@@ -259,6 +262,9 @@
 		81F82CB12E8281F9001EDFA7 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				App/iOS/DaemonClient/DaemonConnectionView.swift,
+				App/iOS/DaemonClient/GSPClient.swift,
+				App/iOS/DaemonClient/RemoteTerminalView.swift,
 				App/iOS/iOSApp.swift,
 				"Features/Custom App Icon/DockTilePlugin.swift",
 				"Ghostty/Surface View/SurfaceView_UIKit.swift",

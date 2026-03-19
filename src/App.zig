@@ -217,8 +217,13 @@ pub fn addSurface(
 ) Allocator.Error!void {
     try self.surfaces.append(self.alloc, rt_surface);
 
-    // Refresh status bars on all surfaces (tab count changed)
-    self.refreshAllStatusBars();
+    // Refresh status bars on existing surfaces (tab count changed).
+    // Skip the newly added surface — it isn't fully initialized yet
+    // and will refresh itself at the end of Surface.init.
+    for (self.surfaces.items) |surface| {
+        if (surface == rt_surface) continue;
+        surface.core_surface.refreshStatusBar() catch {};
+    }
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it

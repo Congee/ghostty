@@ -512,3 +512,162 @@ test "parse SET-COMPONENTS JSON — missing text in component" {
         try std.testing.expectEqual(error.MissingField, err);
     }
 }
+
+// ── Tests: Heirline-Style Status Bar Integration ──
+// Simulates a real neovim heirline.nvim layout like:
+//   [N] [main] [heirline.lua] [+335-174~230] [W:1 E:4]
+//                              ... [M > setup > ViMode] [LSP] [LUA] [30/605:20] [1%]
+
+test "heirline layout — full bar fits in 120 cols" {
+    const left = [_]TestComponent{
+        .{ .text = " N ", .style = .{ .fg = .{ 40, 44, 52 }, .bg = .{ 224, 108, 117 }, .bold = true }, .priority = 200, .click_id = "mode" },
+        .{ .text = " main ", .style = .{ .fg = .{ 152, 195, 121 }, .bg = .{ 62, 68, 82 } }, .priority = 150, .click_id = "git" },
+        .{ .text = " heirline.lua ", .style = .{ .fg = .{ 171, 178, 191 } }, .priority = 180 },
+        .{ .text = " +335-174~230 ", .style = .{ .fg = .{ 152, 195, 121 } }, .priority = 80 },
+        .{ .text = " W:1 E:4 ", .style = .{ .fg = .{ 229, 192, 123 } }, .priority = 120, .click_id = "diag" },
+    };
+
+    var indices: [10]usize = undefined;
+    const count = layoutComponents(&left, 120, &indices);
+    try std.testing.expectEqual(@as(usize, 5), count);
+}
+
+test "heirline layout — narrow terminal drops low-priority diff stats" {
+    var comps = [_]TestComponent{
+        .{ .text = " N ", .priority = 200 },
+        .{ .text = " main ", .priority = 150 },
+        .{ .text = " heirline.lua ", .priority = 180 },
+        .{ .text = " +335-174~230 ", .priority = 80 },
+        .{ .text = " W:1 E:4 ", .priority = 120 },
+    };
+
+    std.mem.sort(TestComponent, &comps, {}, struct {
+        fn cmp(_: void, a: TestComponent, b: TestComponent) bool {
+            return a.priority > b.priority;
+        }
+    }.cmp);
+
+    // Budget: 40 cols — after sort by priority:
+    // N(3,p200) + heirline.lua(14,p180) + main(6,p150) + W:1 E:4(9,p120) = 32, fits
+    // + diff stats(14,p80) = 46, doesn't fit
+    var indices: [10]usize = undefined;
+    const count = layoutComponents(&comps, 40, &indices);
+    try std.testing.expectEqual(@as(usize, 4), count);
+
+    for (0..count) |i| {
+        const text = comps[indices[i]].text;
+        try std.testing.expect(!std.mem.eql(u8, text, " +335-174~230 "));
+    }
+}
+
+test "heirline layout — tabs always highest priority" {
+    var comps = [_]TestComponent{
+        .{ .text = " [0:zsh*] [1:vim] ", .priority = 255 },
+        .{ .text = " N ", .priority = 200 },
+        .{ .text = " main ", .priority = 150 },
+        .{ .text = " heirline.lua ", .priority = 180 },
+        .{ .text = " LUA ", .priority = 90 },
+        .{ .text = " 30/605:20 ", .priority = 100 },
+    };
+
+    std.mem.sort(TestComponent, &comps, {}, struct {
+        fn cmp(_: void, a: TestComponent, b: TestComponent) bool {
+            return a.priority > b.priority;
+        }
+    }.cmp);
+
+    // Budget: 50 — tabs(18) + N(3) + heirline.lua(14) + main(6) = 41, fits
+    var indices: [10]usize = undefined;
+    const count = layoutComponents(&comps, 50, &indices);
+
+    var has_tabs = false;
+    for (0..count) |i| {
+        if (std.mem.eql(u8, comps[indices[i]].text, " [0:zsh*] [1:vim] ")) {
+            has_tabs = true;
+        }
+    }
+    try std.testing.expect(has_tabs);
+}
+
+test "heirline click regions — mode and diagnostics clickable" {
+    const comps = [_]TestComponent{
+        .{ .text = " N ", .click_id = "mode" },
+        .{ .text = " main ", .click_id = "git" },
+        .{ .text = " heirline.lua " },
+        .{ .text = " W:1 E:4 ", .click_id = "diag" },
+    };
+
+    var regions: [10]ClickRegion = undefined;
+    const count = buildClickRegions(&comps, 0, &regions);
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    try std.testing.expectEqualStrings("mode", regions[0].click_id);
+    try std.testing.expectEqual(@as(u16, 0), regions[0].x_start);
+    try std.testing.expectEqual(@as(u16, 3), regions[0].x_end);
+
+    try std.testing.expectEqualStrings("git", regions[1].click_id);
+    try std.testing.expectEqual(@as(u16, 3), regions[1].x_start);
+    try std.testing.expectEqual(@as(u16, 9), regions[1].x_end);
+
+    try std.testing.expectEqualStrings("diag", regions[2].click_id);
+    try std.testing.expectEqual(@as(u16, 23), regions[2].x_start);
+    try std.testing.expectEqual(@as(u16, 32), regions[2].x_end);
+}
+
+test "heirline JSON — full SET-COMPONENTS with styles and clicks" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"zone":"left","source":"nvim-42","components":[
+        \\  {"text":" N ","style":{"fg":"#e06c75","bg":"#282c34","bold":true},"click":{"id":"mode","action":"notify"},"priority":200},
+        \\  {"text":" main ","style":{"fg":"#98c379","bg":"#3e4452"},"click":{"id":"git","action":"cmd:Neogit"},"priority":150},
+        \\  {"text":" heirline.lua ","style":{"fg":"#abb2bf"},"priority":180},
+        \\  {"text":" W:1 E:4 ","style":{"fg":"#e5c07b"},"click":{"id":"diag","action":"key:gd"},"priority":120}
+        \\]}
+    ;
+
+    const result = try parseComponentsJson(alloc, json);
+    defer freeResult(alloc, result);
+
+    try std.testing.expectEqualStrings("left", result.zone);
+    try std.testing.expectEqualStrings("nvim-42", result.source);
+    try std.testing.expectEqual(@as(usize, 4), result.components.len);
+
+    const mode = result.components[0];
+    try std.testing.expectEqualStrings(" N ", mode.text);
+    try std.testing.expectEqual(@as(u8, 0xe0), mode.style.fg.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x28), mode.style.bg.?[0]);
+    try std.testing.expect(mode.style.bold);
+    try std.testing.expectEqual(@as(u8, 200), mode.priority);
+    try std.testing.expectEqualStrings("mode", mode.click_id.?);
+
+    const git = result.components[1];
+    try std.testing.expectEqualStrings(" main ", git.text);
+    try std.testing.expectEqual(@as(u8, 150), git.priority);
+
+    const fname = result.components[2];
+    try std.testing.expectEqualStrings(" heirline.lua ", fname.text);
+    try std.testing.expect(fname.click_id == null);
+    try std.testing.expectEqual(@as(u8, 180), fname.priority);
+
+    const diag = result.components[3];
+    try std.testing.expectEqualStrings(" W:1 E:4 ", diag.text);
+    try std.testing.expectEqual(@as(u8, 120), diag.priority);
+}
+
+test "heirline VT escape — mode component renders SGR correctly" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    try writeComponentEsc(w, .{
+        .text = " N ",
+        .style = .{ .fg = .{ 224, 108, 117 }, .bg = .{ 40, 44, 52 }, .bold = true },
+    });
+
+    const result = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, result, "\x1b[1m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "38;2;224;108;117") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "48;2;40;44;52") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, " N ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\x1b[0m") != null);
+}

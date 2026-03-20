@@ -799,7 +799,10 @@ test "resize session" {
     defer mgr.deinit();
 
     const session = try mgr.createSession(10, 5, null);
-    session.setCell(2, 1, .{ .codepoint = 'Z' });
+    // Feed 'Z' into the terminal emulator so it persists across resize.
+    // Writing directly to the wire cache (setCell) would be lost because
+    // resizeSession re-snapshots from the terminal.
+    session.feedAndSnapshot("Z");
     session.clearDirty();
 
     // Resize to larger
@@ -809,8 +812,8 @@ test "resize session" {
     try std.testing.expectEqual(@as(u16, 10), session.rows);
     try std.testing.expectEqual(@as(usize, 20 * 10), session.cells.len);
 
-    // Original cell should be preserved
-    try std.testing.expectEqual(@as(u32, 'Z'), session.getCell(2, 1).codepoint);
+    // Original cell should be preserved (fed at cursor 0,0)
+    try std.testing.expectEqual(@as(u32, 'Z'), session.getCell(0, 0).codepoint);
 
     // All rows dirty after resize
     for (0..10) |r| {

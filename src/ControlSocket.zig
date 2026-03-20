@@ -331,17 +331,20 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
     const w = fbs.writer();
     w.writeByte('[') catch return "ERR buffer overflow\n";
 
-    for (self.app.surfaces.items, 0..) |surf, i| {
+    var tab_idx: usize = 0;
+    for (self.app.surfaces.items) |surf| {
         const core = &surf.core_surface;
+        if (core.closing) continue;
         const label = core.session.displayLabel();
         const is_active = if (focused) |f| (core == f) else false;
 
-        if (i > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
-        std.fmt.format(w, "{{\"index\":{d},\"title\":", .{i}) catch return "ERR buffer overflow\n";
+        if (tab_idx > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
+        std.fmt.format(w, "{{\"index\":{d},\"title\":", .{tab_idx}) catch return "ERR buffer overflow\n";
         writeJsonString(w, label) catch return "ERR buffer overflow\n";
         std.fmt.format(w, ",\"active\":{s}}}", .{
             if (is_active) "true" else "false",
         }) catch return "ERR buffer overflow\n";
+        tab_idx += 1;
     }
 
     w.writeAll("]\n") catch return "ERR buffer overflow\n";
@@ -352,13 +355,14 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
 fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
 
-    // Find the index of the focused surface
+    // Find the index of the focused surface (excluding closing ones)
     var idx: usize = 0;
-    for (self.app.surfaces.items, 0..) |surf, i| {
-        if (&surf.core_surface == surface) {
-            idx = i;
-            break;
-        }
+    var tab_count: usize = 0;
+    for (self.app.surfaces.items) |surf| {
+        const core = &surf.core_surface;
+        if (core.closing) continue;
+        if (core == surface) idx = tab_count;
+        tab_count += 1;
     }
 
     const info = surface.session.getInfo();
@@ -369,7 +373,7 @@ fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     w.writeAll(",\"title\":") catch return "ERR buffer overflow\n";
     writeJsonString(w, info.title orelse "") catch return "ERR buffer overflow\n";
     std.fmt.format(w, ",\"tabs\":{d}}}\n", .{
-        self.app.surfaces.items.len,
+        tab_count,
     }) catch return "ERR buffer overflow\n";
     return fbs.getWritten();
 }

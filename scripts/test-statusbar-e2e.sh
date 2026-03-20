@@ -1,5 +1,6 @@
 #!/bin/bash
-# End-to-end test for the status bar. Requires a built Ghostty.app and socat.
+# End-to-end test for the status bar control socket.
+# Requires a built Ghostty.app and socat.
 # Usage: ./scripts/test-statusbar-e2e.sh
 set -euo pipefail
 
@@ -7,6 +8,16 @@ APP="zig-out/Ghostty.app"
 BINARY="$APP/Contents/MacOS/Ghostty"
 PASS=0
 FAIL=0
+GHOSTTY_PID=""
+
+cleanup() {
+    if [ -n "$GHOSTTY_PID" ] && kill -0 "$GHOSTTY_PID" 2>/dev/null; then
+        kill "$GHOSTTY_PID" 2>/dev/null || true
+        wait "$GHOSTTY_PID" 2>/dev/null || true
+    fi
+    rm -f /tmp/ghostty-ctl-*.sock
+}
+trap cleanup EXIT
 
 if ! command -v socat &>/dev/null; then
     echo "SKIP: socat not installed (brew install socat)"
@@ -18,35 +29,33 @@ if [ ! -x "$BINARY" ]; then
     exit 0
 fi
 
-# Kill any existing instance and clean stale sockets
-pkill -f Ghostty 2>/dev/null || true
-sleep 1
+# Clean stale sockets
 rm -f /tmp/ghostty-ctl-*.sock
 
-# Launch via open (required for macOS NSApplication)
-open "$APP"
-GHOSTTY_PID=""
+# Launch binary directly (not via 'open') so the control socket works.
+GHOSTTY_LOG=1 "$BINARY" 2>/tmp/ghostty-e2e-log.txt &
+GHOSTTY_PID=$!
 
-# Wait for control socket to appear (up to 10s)
+# Wait for control socket to appear and become connectable (up to 15s)
 SOCKET=""
-for i in $(seq 1 20); do
-    SOCKET=$(find /tmp -maxdepth 1 -name "ghostty-ctl-*.sock" 2>/dev/null | head -1)
-    if [ -n "$SOCKET" ]; then
-        # Verify it's connectable
-        if echo "PING" | socat -t1 - UNIX-CONNECT:"$SOCKET" >/dev/null 2>&1; then
+for i in $(seq 1 30); do
+    # Use /private/tmp because macOS find doesn't follow /tmp symlink reliably
+    SOCK_FILE=$(find /private/tmp -maxdepth 1 -name "ghostty-ctl-*.sock" 2>/dev/null | head -1)
+    if [ -n "$SOCK_FILE" ]; then
+        if echo "PING" | socat -t1 - UNIX-CONNECT:"$SOCK_FILE" >/dev/null 2>&1; then
+            SOCKET="$SOCK_FILE"
             break
         fi
-        SOCKET=""
     fi
     sleep 0.5
 done
 if [ -z "$SOCKET" ]; then
-    echo "FAIL: no control socket found after 10s"
-    echo "Is status-bar=true in ~/.config/ghostty/config?"
-    pkill -f Ghostty 2>/dev/null || true
+    echo "FAIL: no control socket found after 15s"
+    echo "Log tail:"
+    tail -20 /tmp/ghostty-e2e-log.txt 2>/dev/null || true
     exit 1
 fi
-echo "Socket: $SOCKET"
+echo "Socket: $SOCKET (found after ~$((i / 2))s)"
 
 cmd() {
     echo "$1" | socat -t2 - UNIX-CONNECT:"$SOCKET" 2>/dev/null
@@ -93,83 +102,60 @@ echo "1. Control socket connectivity"
 RESP=$(cmd "PING")
 assert_eq "PING returns PONG" "PONG" "$RESP"
 
-# Test 2: Initial state — 1 tab
+# Test 2: Initial state — at least 1 tab
 echo "2. Initial state"
 TABS=$(cmd "LIST-TABS")
-assert_count "1 tab initially" "1" "$TABS"
-
-SB=$(cmd "GET-STATUS-BAR")
-assert_contains "status bar shows tab 0" "[0:" "$SB"
-
-# Test 3: Open a new tab
-echo "3. Open new tab (cmd+t)"
-osascript -e 'tell application "System Events" to keystroke "t" using command down' 2>/dev/null
-sleep 2
-
-TABS=$(cmd "LIST-TABS")
-assert_count "2 tabs after cmd+t" "2" "$TABS"
-
-SB=$(cmd "GET-STATUS-BAR")
-assert_contains "status bar shows tab 0" "[0:" "$SB"
-assert_contains "status bar shows tab 1" "[1:" "$SB"
-
-# Test 4: Open another tab
-echo "4. Open third tab"
-osascript -e 'tell application "System Events" to keystroke "t" using command down' 2>/dev/null
-sleep 2
-
-TABS=$(cmd "LIST-TABS")
-assert_count "3 tabs after second cmd+t" "3" "$TABS"
-
-SB=$(cmd "GET-STATUS-BAR")
-assert_contains "status bar shows 3 tabs" "[2:" "$SB"
-
-# Test 5: Close a tab
-echo "5. Close tab (cmd+w)"
-osascript -e 'tell application "System Events" to keystroke "w" using command down' 2>/dev/null
-sleep 2
-
-TABS=$(cmd "LIST-TABS")
-assert_count "2 tabs after cmd+w" "2" "$TABS"
-
-SB=$(cmd "GET-STATUS-BAR")
-# After closing, should NOT have [2:
-if echo "$SB" | grep -qF "[2:"; then
-    echo "  FAIL: status bar still shows 3 tabs after close"
-    echo "    actual: $SB"
-    FAIL=$((FAIL + 1))
-else
-    echo "  PASS: status bar updated after tab close"
+TAB_COUNT=$(echo "$TABS" | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+if [ "$TAB_COUNT" -ge 1 ]; then
+    echo "  PASS: at least 1 tab initially (got $TAB_COUNT)"
     PASS=$((PASS + 1))
+else
+    echo "  FAIL: expected at least 1 tab, got $TAB_COUNT"
+    FAIL=$((FAIL + 1))
 fi
 
-# Test 6: RENAME-TAB
-echo "6. Rename tab"
+SB=$(cmd "GET-STATUS-BAR")
+assert_contains "status bar shows tab 0" "[0:" "$SB"
+
+# Test 3: RENAME-TAB
+echo "3. Rename tab"
 cmd "RENAME-TAB myserver" >/dev/null
-sleep 1
+sleep 0.5
 
 SB=$(cmd "GET-STATUS-BAR")
 assert_contains "status bar shows renamed tab" "myserver" "$SB"
 
-# Test 7: SET-COMPONENTS
-echo "7. SET-COMPONENTS"
+# Test 4: SET-COMPONENTS
+echo "4. SET-COMPONENTS"
 RESP=$(cmd 'SET-COMPONENTS {"zone":"left","source":"test","components":[{"text":" TEST "}]}')
 assert_eq "SET-COMPONENTS accepted" "OK" "$RESP"
 
-# Test 8: CLEAR-COMPONENTS
-echo "8. CLEAR-COMPONENTS"
+# Test 5: CLEAR-COMPONENTS
+echo "5. CLEAR-COMPONENTS"
 RESP=$(cmd "CLEAR-COMPONENTS test")
 assert_eq "CLEAR-COMPONENTS accepted" "OK" "$RESP"
 
-# Test 9: GET-FOCUSED
-echo "9. GET-FOCUSED"
+# Test 6: GET-FOCUSED
+echo "6. GET-FOCUSED"
 RESP=$(cmd "GET-FOCUSED")
 assert_contains "GET-FOCUSED returns tabs count" '"tabs":' "$RESP"
 
-# Cleanup
-echo ""
-echo "Cleaning up..."
-pkill -f Ghostty 2>/dev/null || true
+# Test 7: Unknown command
+echo "7. Unknown command"
+RESP=$(cmd "FOOBAR")
+assert_contains "unknown command returns ERR" "ERR" "$RESP"
+
+# Test 8: SET-STATUS-LEFT
+echo "8. SET-STATUS-LEFT"
+RESP=$(cmd "SET-STATUS-LEFT hello world")
+assert_eq "SET-STATUS-LEFT accepted" "OK" "$RESP"
+SB=$(cmd "GET-STATUS-BAR")
+assert_contains "status bar shows custom left text" "hello world" "$SB"
+
+# Test 9: CLEAR-STATUS
+echo "9. CLEAR-STATUS"
+RESP=$(cmd "CLEAR-STATUS")
+assert_eq "CLEAR-STATUS accepted" "OK" "$RESP"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

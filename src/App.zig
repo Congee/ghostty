@@ -670,7 +670,10 @@ pub fn logSessions(self: *App) void {
 /// changes (surface created/destroyed/renamed) so all status bars update.
 pub fn refreshAllStatusBars(self: *App) void {
     for (self.surfaces.items) |surface| {
-        surface.core_surface.refreshStatusBar() catch {};
+        if (surface.core_surface.closing) continue;
+        surface.core_surface.refreshStatusBar() catch |err| {
+            log.warn("refreshStatusBar failed err={}", .{err});
+        };
     }
 }
 

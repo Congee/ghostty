@@ -140,6 +140,10 @@ config_conditional_state: configpkg.ConditionalState,
 
 /// child_exited is tracked by the session. Access via self.session.child_exited.
 
+/// Set to true when close() is called. Used to exclude this surface from
+/// the status bar tab list immediately, before the async teardown completes.
+closing: bool = false,
+
 /// We maintain our focus state and assume we're focused by default.
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
@@ -886,7 +890,16 @@ pub fn deinit(self: *Surface) void {
 /// Close this surface. This will trigger the runtime to start the
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
-    self.rt_surface.close(self.needsConfirmQuit());
+    const needs_confirm = self.needsConfirmQuit();
+    if (!needs_confirm) {
+        // No confirmation needed — mark as closing immediately so the
+        // status bar updates right away, before the async teardown.
+        self.closing = true;
+        self.app.refreshAllStatusBars();
+    }
+    // If confirmation is needed, we don't set closing yet because the
+    // user might cancel. The flag will be set when deleteSurface runs.
+    self.rt_surface.close(needs_confirm);
 }
 
 /// Returns a mailbox that can be used to send messages to this surface.
@@ -2655,15 +2668,20 @@ pub fn refreshStatusBar(self: *Surface) !void {
     const w = text_buf.writer(self.alloc);
 
     const surfaces = self.app.surfaces.items;
-    for (surfaces, 0..) |surf, i| {
+    var tab_idx: usize = 0;
+    for (surfaces) |surf| {
         const core_surface: *Surface = &surf.core_surface;
+        // Skip surfaces that are closing — they will be removed from
+        // the list when ghostty_surface_free runs asynchronously.
+        if (core_surface.closing) continue;
         const label = core_surface.session.displayLabel();
         const is_active = (core_surface == self);
         if (is_active) {
-            try w.print(" [{d}:{s}*]", .{ i, label });
+            try w.print(" [{d}:{s}*]", .{ tab_idx, label });
         } else {
-            try w.print(" [{d}:{s}]", .{ i, label });
+            try w.print(" [{d}:{s}]", .{ tab_idx, label });
         }
+        tab_idx += 1;
     }
 
     const left = try text_buf.toOwnedSlice(self.alloc);

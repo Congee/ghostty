@@ -2686,10 +2686,14 @@ pub fn refreshStatusBar(self: *Surface) !void {
 
     try w.writeAll("\x1b[0m\x1b8"); // Reset attributes, restore cursor
 
-    // Send via IO mailbox — the IO thread will call processOutput()
-    // which safely feeds the bytes through the terminal parser.
-    const msg = try termio.Message.injectReq(self.alloc, buf.items);
-    self.session.io.queueMessage(msg, .unlocked);
+    // Send as persistent status bar — the IO thread stores these bytes
+    // and re-injects them after every processOutput, keeping the status
+    // bar visible even when the shell resets DECSTBM.
+    const vt_data = try self.alloc.dupe(u8, buf.items);
+    self.session.io.queueMessage(.{ .set_status_bar = .{
+        .data = vt_data,
+        .alloc = self.alloc,
+    } }, .unlocked);
 }
 
 

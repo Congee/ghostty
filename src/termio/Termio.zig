@@ -63,6 +63,11 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// Pre-built VT escape bytes for the status bar. Re-injected after
+/// every processOutput to keep the status bar visible. Updated via
+/// the set_status_bar mailbox message from the main thread.
+status_bar_vt: ?[]const u8 = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.time.Instant = null,
@@ -757,6 +762,12 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
     } else {
         self.terminal_stream.nextSlice(buf);
+    }
+
+    // Re-inject the status bar after processing output so it stays
+    // visible even if the shell resets DECSTBM or scrolls.
+    if (self.status_bar_vt) |vt_bytes| {
+        self.terminal_stream.nextSlice(vt_bytes);
     }
 
     // If our stream handling caused messages to be sent to the mailbox

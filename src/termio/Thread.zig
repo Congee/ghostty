@@ -381,6 +381,13 @@ fn drainMailbox(
                 defer v.alloc.free(v.data);
                 io.processOutput(v.data);
             },
+            .set_status_bar => |v| {
+                // Replace the persistent status bar VT bytes
+                if (io.status_bar_vt) |old| v.alloc.free(old);
+                io.status_bar_vt = v.data; // ownership transferred
+                // Inject immediately
+                io.processOutput(v.data);
+            },
         }
     }
 

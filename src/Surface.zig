@@ -2648,27 +2648,44 @@ pub fn clearComponents(self: *Surface, source: []const u8) !void {
 pub fn refreshStatusBar(self: *Surface) !void {
     if (!self.config.status_bar_enabled) return;
 
-    // Build tab list text
-    var text_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer text_buf.deinit(self.alloc);
-    const w = text_buf.writer(self.alloc);
+    // Safety: renderer_state.terminal must be initialized
+    const t = self.renderer_state.terminal;
+    const t_ptr = @intFromPtr(t);
+    if (t_ptr == 0 or t_ptr == 0xaaaaaaaaaaaaaaaa) return;
 
+    const rows = t.screens.active.pages.rows;
+    if (rows < 2) return;
+
+    // Build VT escape sequence to write status bar on last row
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(self.alloc);
+    const w = buf.writer(self.alloc);
+
+    const status_row = rows;
+
+    try w.writeAll("\x1b7"); // Save cursor
+    try w.print("\x1b[1;{d}r", .{rows - 1}); // Scroll region excludes last row
+    try w.print("\x1b[{d};1H", .{status_row}); // Move to last row
+    try w.writeAll("\x1b[0m\x1b[7m\x1b[K"); // Reset, reverse video, clear line
+
+    // Write tab list
     const surfaces = self.app.surfaces.items;
     for (surfaces, 0..) |surf, i| {
         const core_surface: *Surface = &surf.core_surface;
         const label = core_surface.session.displayLabel();
         const is_active = (core_surface == self);
-        if (is_active) {
-            try w.print(" [{d}:{s}*]", .{ i, label });
-        } else {
-            try w.print(" [{d}:{s}]", .{ i, label });
-        }
+        if (is_active) try w.writeAll("\x1b[1m"); // Bold active tab
+        try w.print(" {d}:{s}", .{ i, label });
+        if (is_active) try w.writeAll("*\x1b[22m");
     }
 
-    const left = try text_buf.toOwnedSlice(self.alloc);
-    defer self.alloc.free(left);
+    try w.writeAll("\x1b[0m\x1b8"); // Reset attributes, restore cursor
 
-    try self.setStatusBar(left, "");
+    // Feed to terminal
+    var stream = t.vtStream();
+    stream.nextSlice(buf.items);
+
+    try self.queueRender();
 }
 
 

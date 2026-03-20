@@ -60,8 +60,9 @@ class HiddenTitlebarTerminalWindow: TerminalWindow {
         standardWindowButton(.miniaturizeButton)?.isHidden = true
         standardWindowButton(.zoomButton)?.isHidden = true
 
-        // When a status bar is active, allow tabbing even with hidden titlebar
-        // (the status bar replaces the native tab bar). Otherwise disallow.
+        // Allow tabbing even with hidden titlebar so cmd+t creates tabs
+        // (not windows). The status bar shows the tab list instead of the
+        // native tab bar.
         tabbingMode = .preferred
 
         // Nuke it from orbit -- hide the titlebar container entirely, just in case. There are

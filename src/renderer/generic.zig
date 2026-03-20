@@ -3345,6 +3345,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const terminal_rows = self.cells.size.rows - self.status_bar_rows;
             const cols = self.cells.size.columns;
 
+            // Clear the status bar row's text cells from the previous frame.
+            // Without this, incremental rebuilds (non-full dirty) leave old
+            // text glyphs in the buffer, causing garbled overlapping text.
+            self.cells.clear(terminal_rows);
+
             // Set bg color for the status bar row (reverse video: fg as bg)
             const bg_color: shaderpkg.CellBg = .{
                 self.config.foreground.r,

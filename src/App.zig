@@ -127,16 +127,19 @@ pub fn init(
 pub fn ensureControlSocket(self: *App, socket_path: ?[]const u8) void {
     if (self.control_socket != null) return;
 
-    var sock = ControlSocket.init(self.alloc, self, socket_path) catch |err| {
+    // Store FIRST, then start. The thread captures a pointer to
+    // self.control_socket — if we start before storing, the thread
+    // gets a dangling pointer to a stack-local variable.
+    self.control_socket = ControlSocket.init(self.alloc, self, socket_path) catch |err| {
         log.warn("failed to init control socket: {}", .{err});
         return;
     };
-    sock.start() catch |err| {
+    self.control_socket.?.start() catch |err| {
         log.warn("failed to start control socket: {}", .{err});
-        sock.deinit();
+        self.control_socket.?.deinit();
+        self.control_socket = null;
         return;
     };
-    self.control_socket = sock;
 }
 
 pub fn deinit(self: *App) void {

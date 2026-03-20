@@ -26,15 +26,6 @@ const Component = renderer.State.Component;
 
 const log = std.log.scoped(.control_socket);
 
-// Temporary file-based debug logging (macOS unified log not visible)
-fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    const file = std.fs.cwd().createFile("/tmp/ghostty-ctl-debug.log", .{ .truncate = false }) catch return;
-    defer file.close();
-    file.seekFromEnd(0) catch {};
-    var buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
-    file.writeAll(msg) catch {};
-}
 
 alloc: Allocator,
 path: []const u8,
@@ -121,7 +112,7 @@ pub fn start(self: *ControlSocket) !void {
 }
 
 pub fn stop(self: *ControlSocket) void {
-    debugLog("stop() called", .{});
+    log.warn("stop() called", .{});
     self.running.store(false, .release);
     // Close the listening socket to unblock accept
     if (self.socket_fd) |fd| {
@@ -135,10 +126,10 @@ pub fn stop(self: *ControlSocket) void {
 }
 
 fn acceptLoop(self: *ControlSocket) void {
-    debugLog("accept loop started on {s}, running={}", .{ self.path, self.running.load(.acquire) });
+    log.warn("accept loop started on {s}, running={}", .{ self.path, self.running.load(.acquire) });
     while (self.running.load(.acquire)) {
         const fd = self.socket_fd orelse {
-            debugLog("accept loop: socket_fd is null", .{});
+            log.warn("accept loop: socket_fd is null", .{});
             return;
         };
         const conn = posix.accept(fd, null, null, 0) catch |err| {
@@ -146,12 +137,12 @@ fn acceptLoop(self: *ControlSocket) void {
             log.warn("accept error: {}", .{err});
             continue;
         };
-        debugLog("accepted connection fd={}", .{conn});
+        log.warn("accepted connection fd={}", .{conn});
         if (!self.handleConnection(conn)) {
             posix.close(conn);
         }
     }
-    debugLog("accept loop exited, running={}", .{self.running.load(.acquire)});
+    log.warn("accept loop exited, running={}", .{self.running.load(.acquire)});
 }
 
 /// Returns true if the connection should be kept open (subscriptions).
@@ -167,7 +158,7 @@ fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
     }
 
     const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
-    debugLog("handleConnection: received '{s}' fd={}", .{ line, conn });
+    log.warn("handleConnection: received '{s}' fd={}", .{ line, conn });
 
     // SUBSCRIBE-CLICKS: keep connection open for push notifications
     if (std.mem.startsWith(u8, line, "SUBSCRIBE-CLICKS ")) {
@@ -202,7 +193,7 @@ fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
         return false;
     };
 
-    debugLog("handleConnection: responding with {d} bytes fd={}", .{ response.len, conn });
+    log.warn("handleConnection: responding with {d} bytes fd={}", .{ response.len, conn });
     _ = posix.write(conn, response) catch |err| {
         log.warn("handleConnection: write error fd={} err={}", .{ conn, err });
     };

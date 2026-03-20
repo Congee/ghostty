@@ -21,15 +21,16 @@ fi
 # Kill any existing instance and clean stale sockets
 pkill -f Ghostty 2>/dev/null || true
 sleep 1
-rm -f /tmp/ghostty-ctl-*.sock 2>/dev/null || true
+rm -f /tmp/ghostty-ctl-*.sock
 
-# Launch ghostty
-open "$APP"
+# Launch ghostty directly (not via `open`) so stderr is captured
+GHOSTTY_LOG=1 "$BINARY" 2>/tmp/ghostty-e2e.log &
+GHOSTTY_PID=$!
 
 # Wait for control socket to appear (up to 10s)
 SOCKET=""
 for i in $(seq 1 20); do
-    SOCKET=$(ls /tmp/ghostty-ctl-*.sock 2>/dev/null | head -1)
+    SOCKET=$(find /tmp -maxdepth 1 -name "ghostty-ctl-*.sock" 2>/dev/null | head -1)
     if [ -n "$SOCKET" ]; then
         # Verify it's connectable
         if echo "PING" | socat -t1 - UNIX-CONNECT:"$SOCKET" >/dev/null 2>&1; then
@@ -168,7 +169,8 @@ assert_contains "GET-FOCUSED returns tabs count" '"tabs":' "$RESP"
 # Cleanup
 echo ""
 echo "Cleaning up..."
-pkill -f Ghostty 2>/dev/null || true
+kill $GHOSTTY_PID 2>/dev/null || true
+wait $GHOSTTY_PID 2>/dev/null || true
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

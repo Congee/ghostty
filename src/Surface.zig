@@ -819,8 +819,9 @@ pub fn init(
     // We are no longer the first surface
     app.first = false;
 
-    // Render initial status bar content (shows tab list)
-    self.refreshStatusBar() catch {};
+    // Refresh status bars on ALL surfaces (this surface is now fully
+    // initialized so it's safe to call displayLabel on its session).
+    app.refreshAllStatusBars();
 }
 
 pub fn deinit(self: *Surface) void {
@@ -2647,207 +2648,31 @@ pub fn clearComponents(self: *Surface, source: []const u8) !void {
 pub fn refreshStatusBar(self: *Surface) !void {
     if (!self.config.status_bar_enabled) return;
 
-    // Build VT escape sequence buffer
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(self.alloc);
-    const w = buf.writer(self.alloc);
+    // Build tab list text
+    var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer text_buf.deinit(self.alloc);
+    const w = text_buf.writer(self.alloc);
 
-    // Get terminal dimensions
-    const t = self.renderer_state.terminal;
-    const rows = t.screens.active.pages.rows;
-    const cols = t.screens.active.pages.cols;
-    if (rows < 2 or cols < 10) return;
-
-    const status_row = rows; // 1-based, last row
-
-    // Save cursor + set scrolling region to exclude last row
-    try w.writeAll("\x1b7"); // DECSC
-    try w.print("\x1b[1;{d}r", .{rows - 1}); // DECSTBM: scroll region = 1..N-1
-
-    // Move to status bar row, clear it
-    try w.print("\x1b[{d};1H", .{status_row}); // CUP to last row
-    try w.writeAll("\x1b[0m"); // Reset attributes
-    try w.writeAll("\x1b[7m"); // Reverse video for status bar background
-    try w.writeAll("\x1b[K"); // Clear line
-
-    var click_regions: std.ArrayListUnmanaged(rendererpkg.State.ClickRegion) = .empty;
-    defer click_regions.deinit(self.alloc);
-    var col_pos: u16 = 0;
-
-    // ── Phase 1: Calculate tab width (always highest priority) ──
     const surfaces = self.app.surfaces.items;
-    var tab_width: u16 = 0;
-    for (surfaces, 0..) |surf, i| {
-        const core_surface: *Surface = &surf.core_surface;
-        const label = core_surface.session.displayLabel();
-        tab_width += 1; // space
-        var iv = i;
-        var digits: u16 = 1;
-        while (iv >= 10) : (iv /= 10) digits += 1;
-        tab_width += digits + 1; // digits + ':'
-        tab_width += @intCast(label.len);
-        if (core_surface == self) tab_width += 1; // '*'
-    }
-
-    // ── Phase 2: Budget remaining space for external components ──
-    const remaining: u16 = if (cols > tab_width) cols - tab_width else 0;
-
-    // Deep-clone the status bar under lock to avoid use-after-free
-    // (another thread may call setComponents/clearComponents concurrently).
-    self.renderer_state.mutex.lock();
-    const sb = if (self.renderer_state.status_bar) |*s|
-        s.clone(self.alloc) catch null
-    else
-        null;
-    self.renderer_state.mutex.unlock();
-    defer if (sb) |s| s.deinit(self.alloc);
-
-    // Components are rendered by priority (descending): highest priority first,
-    // lowest-priority components dropped when space is tight.
-    var left_budget: u16 = remaining / 2;
-    const right_budget: u16 = remaining - left_budget;
-
-    // ── Phase 3: Write left components (sorted by priority descending) ──
-    if (sb) |s| {
-        // Sort by priority descending (cloned, so mutable)
-        const left_mut: []rendererpkg.State.Component = @constCast(s.left_components);
-        std.mem.sort(rendererpkg.State.Component, left_mut, {}, struct {
-            fn cmp(_: void, a: rendererpkg.State.Component, b: rendererpkg.State.Component) bool {
-                return a.priority > b.priority;
-            }
-        }.cmp);
-        for (s.left_components) |comp| {
-            const comp_width: u16 = @intCast(comp.text.len);
-            if (comp_width > left_budget) continue; // drop — no space
-            const start = col_pos;
-            try writeComponentEsc(w, comp);
-            col_pos += comp_width;
-            left_budget -= comp_width;
-            if (comp.click) |cl| {
-                try click_regions.append(self.alloc, .{
-                    .x_start = start,
-                    .x_end = col_pos,
-                    .click_id = cl.id,
-                    .source_id = s.left_source,
-                    .action = cl.action,
-                });
-            }
-        }
-    }
-
-    // ── Phase 4: Write tabs (always included) ──
-    try w.writeAll("\x1b[0m\x1b[7m");
     for (surfaces, 0..) |surf, i| {
         const core_surface: *Surface = &surf.core_surface;
         const label = core_surface.session.displayLabel();
         const is_active = (core_surface == self);
-
-        if (is_active) try w.writeAll("\x1b[1m");
-
-        const tab_start = col_pos;
-        try w.print(" {d}:{s}", .{ i, label });
-        col_pos += 1;
-        var iv = i;
-        var digits: u16 = 1;
-        while (iv >= 10) : (iv /= 10) digits += 1;
-        col_pos += digits + 1;
-        col_pos += @intCast(label.len);
-
         if (is_active) {
-            try w.writeAll("*\x1b[22m");
-            col_pos += 1;
-        }
-
-        try click_regions.append(self.alloc, .{
-            .x_start = tab_start,
-            .x_end = col_pos,
-            .click_id = "",
-            .source_id = "",
-            .action = .{ .key = "" },
-        });
-    }
-
-    // ── Phase 5: Write right components (right-aligned, sorted by priority) ──
-    if (sb) |s| {
-        if (s.right_components.len > 0) {
-            const right_mut: []rendererpkg.State.Component = @constCast(s.right_components);
-            std.mem.sort(rendererpkg.State.Component, right_mut, {}, struct {
-                fn cmp(_: void, a: rendererpkg.State.Component, b: rendererpkg.State.Component) bool {
-                    return a.priority > b.priority;
-                }
-            }.cmp);
-            var total_right: u16 = 0;
-            for (s.right_components) |comp| {
-                const cw: u16 = @intCast(comp.text.len);
-                if (cw <= right_budget - total_right) {
-                    total_right += cw;
-                }
-            }
-            if (total_right > 0 and total_right < cols) {
-                col_pos = cols - total_right;
-                try w.print("\x1b[{d};{d}H", .{ status_row, col_pos + 1 });
-            }
-            for (s.right_components) |comp| {
-                const cw: u16 = @intCast(comp.text.len);
-                if (col_pos + cw > cols) continue;
-                const start = col_pos;
-                try writeComponentEsc(w, comp);
-                col_pos += cw;
-                if (comp.click) |cl| {
-                    try click_regions.append(self.alloc, .{
-                        .x_start = start,
-                        .x_end = col_pos,
-                        .click_id = cl.id,
-                        .source_id = s.right_source,
-                        .action = cl.action,
-                    });
-                }
-            }
+            try w.print(" [{d}:{s}*]", .{ i, label });
+        } else {
+            try w.print(" [{d}:{s}]", .{ i, label });
         }
     }
 
-    // Store click regions on the live status bar state
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        if (self.renderer_state.status_bar) |*live_sb| {
-            if (live_sb.click_regions.len > 0) self.alloc.free(live_sb.click_regions);
-            live_sb.click_regions = try click_regions.toOwnedSlice(self.alloc);
-        }
-    }
+    const left = try text_buf.toOwnedSlice(self.alloc);
+    defer self.alloc.free(left);
 
-    // Restore cursor and attributes. Keep DECSTBM at 1..N-1 so the shell
-    // cannot scroll into the status bar row.
-    try w.writeAll("\x1b[0m"); // Reset attributes
-    try w.writeAll("\x1b8"); // DECRC
-
-    // Feed the escape sequences into the terminal
-    var stream = t.vtStream();
-    stream.nextSlice(buf.items);
-
-    try self.queueRender();
+    try self.setStatusBar(left, "");
 }
 
-/// Write a Component as VT escape sequences (SGR colors + text).
-fn writeComponentEsc(w: anytype, comp: rendererpkg.State.Component) !void {
-    // Set style
-    if (comp.style.fg) |fg| {
-        try w.print("\x1b[38;2;{d};{d};{d}m", .{ fg[0], fg[1], fg[2] });
-    }
-    if (comp.style.bg) |bg| {
-        try w.print("\x1b[48;2;{d};{d};{d}m", .{ bg[0], bg[1], bg[2] });
-    }
-    if (comp.style.bold) try w.writeAll("\x1b[1m");
-    if (comp.style.italic) try w.writeAll("\x1b[3m");
-    if (comp.style.underline) try w.writeAll("\x1b[4m");
-    if (comp.style.strikethrough) try w.writeAll("\x1b[9m");
 
-    // Write text
-    try w.writeAll(comp.text);
 
-    // Reset after component
-    try w.writeAll("\x1b[0m\x1b[7m"); // Reset + re-enable reverse video
-}
 
 pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     // log.debug("text preeditCallback value={any}", .{preedit_});

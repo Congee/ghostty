@@ -11,28 +11,31 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
 /// The kinds of backends.
-pub const Kind = enum { exec };
+pub const Kind = enum { exec, daemon };
 
 /// Configuration for the various backend types.
 pub const Config = union(Kind) {
     /// Exec uses posix exec to run a command with a pty.
     exec: termio.Exec.Config,
+    /// Daemon connects to a remote ghostty-daemon via GSP protocol.
+    daemon: termio.Daemon.Config,
 };
 
 /// Backend implementations. A backend is responsible for owning the pty
 /// behavior and providing read/write capabilities.
 pub const Backend = union(Kind) {
     exec: termio.Exec,
+    daemon: termio.Daemon,
 
     pub fn deinit(self: *Backend) void {
         switch (self.*) {
-            .exec => |*exec| exec.deinit(),
+            inline else => |*b| b.deinit(),
         }
     }
 
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
-            .exec => |*exec| exec.initTerminal(t),
+            inline else => |*b| b.initTerminal(t),
         }
     }
 
@@ -43,7 +46,7 @@ pub const Backend = union(Kind) {
         td: *termio.Termio.ThreadData,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.threadEnter(alloc, io, td),
+            inline else => |*b| try b.threadEnter(alloc, io, td),
         }
     }
 
@@ -54,19 +57,19 @@ pub const Backend = union(Kind) {
         td: *termio.Termio.ThreadData,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.threadReenter(alloc, io, td),
+            inline else => |*b| try b.threadReenter(alloc, io, td),
         }
     }
 
     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
-            .exec => |*exec| exec.threadExit(td),
+            inline else => |*b| b.threadExit(td),
         }
     }
 
     pub fn threadPark(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
-            .exec => |*exec| exec.threadPark(td),
+            inline else => |*b| b.threadPark(td),
         }
     }
 
@@ -76,7 +79,7 @@ pub const Backend = union(Kind) {
         focused: bool,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.focusGained(td, focused),
+            inline else => |*b| try b.focusGained(td, focused),
         }
     }
 
@@ -86,7 +89,7 @@ pub const Backend = union(Kind) {
         screen_size: renderer.ScreenSize,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.resize(grid_size, screen_size),
+            inline else => |*b| try b.resize(grid_size, screen_size),
         }
     }
 
@@ -98,7 +101,7 @@ pub const Backend = union(Kind) {
         linefeed: bool,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            inline else => |*b| try b.queueWrite(alloc, td, data, linefeed),
         }
     }
 
@@ -110,12 +113,7 @@ pub const Backend = union(Kind) {
         runtime_ms: u64,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.childExitedAbnormally(
-                gpa,
-                t,
-                exit_code,
-                runtime_ms,
-            ),
+            inline else => |*b| try b.childExitedAbnormally(gpa, t, exit_code, runtime_ms),
         }
     }
 
@@ -132,10 +130,11 @@ pub const Backend = union(Kind) {
 /// Termio thread data. See termio.ThreadData for docs.
 pub const ThreadData = union(Kind) {
     exec: termio.Exec.ThreadData,
+    daemon: termio.Daemon.ThreadData,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         switch (self.*) {
-            .exec => |*exec| exec.deinit(alloc),
+            inline else => |*b| b.deinit(alloc),
         }
     }
 

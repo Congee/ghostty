@@ -234,6 +234,7 @@ pub fn getInfo(self: *const Session) SessionInfo {
     // Get command name from subprocess
     const command: ?[:0]const u8 = switch (self.io.backend) {
         .exec => |exec| if (exec.subprocess.args.len > 0) exec.subprocess.args[0] else null,
+        .daemon => null,
     };
 
     return .{

@@ -68,7 +68,15 @@ fn getAuthKey() []const u8 {
 
 pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
     if (std.mem.startsWith(u8, socket_path, "tcp:")) {
-        return isDaemonRunningTcp(socket_path["tcp:".len..]);
+        const addr_str = socket_path["tcp:".len..];
+        const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return false;
+        const host = addr_str[0..colon];
+        const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch return false;
+        const addr = std.net.Address.resolveIp(host, port) catch return false;
+        const fd = posix.socket(addr.any.family, posix.SOCK.STREAM, 0) catch return false;
+        defer posix.close(fd);
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+        return probeGsp(fd);
     }
     const path = if (std.mem.startsWith(u8, socket_path, "unix:"))
         socket_path["unix:".len..]
@@ -78,36 +86,11 @@ pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
     const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
     defer posix.close(fd);
     posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
-
-    // GSP: magic('G','S') + type(LIST_SESSIONS=0x02) + length(0)
-    const probe = [_]u8{ 'G', 'S', 0x02, 0, 0, 0, 0 };
-    var sent: usize = 0;
-    while (sent < probe.len) {
-        const n = posix.write(fd, probe[sent..]) catch return false;
-        if (n == 0) return false;
-        sent += n;
-    }
-
-    var hdr: [7]u8 = undefined;
-    var total: usize = 0;
-    while (total < hdr.len) {
-        const n = posix.read(fd, hdr[total..]) catch return false;
-        if (n == 0) return false;
-        total += n;
-    }
-
-    return hdr[0] == 'G' and hdr[1] == 'S';
+    return probeGsp(fd);
 }
 
-fn isDaemonRunningTcp(addr_str: []const u8) bool {
-    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return false;
-    const host = addr_str[0..colon];
-    const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch return false;
-    const addr = std.net.Address.resolveIp(host, port) catch return false;
-    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM, 0) catch return false;
-    defer posix.close(fd);
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
-
+/// Send a GSP LIST_SESSIONS probe and check for valid GS magic response.
+fn probeGsp(fd: posix.socket_t) bool {
     const probe = [_]u8{ 'G', 'S', 0x02, 0, 0, 0, 0 };
     var sent: usize = 0;
     while (sent < probe.len) {

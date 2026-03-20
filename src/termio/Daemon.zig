@@ -13,6 +13,7 @@ const Protocol = @import("gsp");
 
 const log = std.log.scoped(.io_daemon);
 
+alloc: Allocator,
 /// Connection file descriptor to the daemon.
 fd: posix.socket_t,
 /// Auth key for HMAC challenge-response (empty = no auth).
@@ -25,6 +26,8 @@ reader_thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 /// The termio instance (set during threadEnter).
 io: ?*termio.Termio = null,
+/// Mutex for write-side serialization (header+payload must be atomic).
+write_mutex: std.Thread.Mutex = .{},
 
 pub const Config = struct {
     /// Daemon address: "unix:/path" or "tcp:host:port"
@@ -44,15 +47,17 @@ pub fn init(alloc: Allocator, cfg: Config) !Daemon {
 
     // Authenticate if needed
     if (cfg.auth_key.len > 0) {
-        try authenticate(fd, cfg.auth_key);
+        try authenticate(alloc, fd, cfg.auth_key);
     }
 
     const auth_key = if (cfg.auth_key.len > 0)
         try alloc.dupe(u8, cfg.auth_key)
     else
         "";
+    errdefer if (auth_key.len > 0) alloc.free(auth_key);
 
     return .{
+        .alloc = alloc,
         .fd = fd,
         .auth_key = auth_key,
     };
@@ -60,12 +65,12 @@ pub fn init(alloc: Allocator, cfg: Config) !Daemon {
 
 pub fn deinit(self: *Daemon) void {
     self.running.store(false, .release);
-    // Close fd to unblock any read in the reader thread
     posix.close(self.fd);
     if (self.reader_thread) |t| {
         t.join();
         self.reader_thread = null;
     }
+    if (self.auth_key.len > 0) self.alloc.free(self.auth_key);
 }
 
 pub fn initTerminal(_: *Daemon, _: *terminal.Terminal) void {}
@@ -84,10 +89,11 @@ pub fn threadEnter(
     const rows: u16 = io.terminal.rows;
     std.mem.writeInt(u16, create_payload[0..2], cols, .little);
     std.mem.writeInt(u16, create_payload[2..4], rows, .little);
-    try sendMessage(self.fd, .create, &create_payload);
+    try self.sendMessageLocked(.create, &create_payload);
 
-    // Read response — should be session_created
-    var msg = try readMessage(self.fd);
+    // Read response — should be session_created (no reader thread yet, safe)
+    var msg = try readMessage(self.alloc, self.fd);
+    defer self.alloc.free(msg.payload_buf);
     if (msg.msg_type == .session_created and msg.payload.len >= 4) {
         self.attached_session_id = std.mem.readInt(u32, msg.payload[0..4], .little);
         log.info("created session id={}", .{self.attached_session_id});
@@ -95,7 +101,7 @@ pub fn threadEnter(
         // Attach to it
         var attach_payload: [4]u8 = undefined;
         std.mem.writeInt(u32, attach_payload[0..4], self.attached_session_id, .little);
-        try sendMessage(self.fd, .attach, &attach_payload);
+        try self.sendMessageLocked(.attach, &attach_payload);
     } else if (msg.msg_type == .error_msg) {
         log.err("daemon error: {s}", .{msg.payload});
         return error.DaemonError;
@@ -125,7 +131,7 @@ pub fn resize(self: *Daemon, grid_size: renderer.GridSize, _: renderer.ScreenSiz
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u16, payload[0..2], grid_size.columns, .little);
     std.mem.writeInt(u16, payload[2..4], grid_size.rows, .little);
-    sendMessage(self.fd, .resize, &payload) catch |err| {
+    self.sendMessageLocked(.resize, &payload) catch |err| {
         log.warn("resize send failed: {}", .{err});
     };
 }
@@ -137,8 +143,7 @@ pub fn queueWrite(
     data: []const u8,
     _: bool,
 ) !void {
-    // Send keyboard input to the daemon
-    sendMessage(self.fd, .input, data) catch |err| {
+    self.sendMessageLocked(.input, data) catch |err| {
         log.warn("input send failed: {}", .{err});
     };
 }
@@ -150,11 +155,12 @@ pub fn childExitedAbnormally(_: *Daemon, _: Allocator, _: *terminal.Terminal, _:
 fn readerThread(self: *Daemon) void {
     log.info("daemon reader thread started", .{});
     while (self.running.load(.acquire)) {
-        const msg = readMessage(self.fd) catch |err| {
+        const msg = readMessage(self.alloc, self.fd) catch |err| {
             if (!self.running.load(.acquire)) return;
             log.warn("read error: {}", .{err});
             return;
         };
+        defer self.alloc.free(msg.payload_buf);
 
         switch (msg.msg_type) {
             .attached => log.info("attached to session", .{}),
@@ -207,7 +213,9 @@ fn applyFullState(self: *Daemon, payload: []const u8) void {
             const base = offset;
             const cp = std.mem.readInt(u32, payload[base..][0..4], .little);
             if (cp >= 0x20) {
-                t.print(@intCast(cp)) catch {};
+                t.print(@intCast(cp)) catch |err| {
+                    log.debug("terminal print error cp=0x{x}: {}", .{ cp, err });
+                };
             }
             offset += 12;
         }
@@ -252,9 +260,12 @@ fn applyDelta(self: *Daemon, payload: []const u8) void {
             const base = offset + @as(usize, col) * 12;
             const cp = std.mem.readInt(u32, payload[base..][0..4], .little);
             if (cp >= 0x20) {
-                t.print(@intCast(cp)) catch {};
+                t.print(@intCast(cp)) catch |err| {
+                    log.debug("terminal print error cp=0x{x}: {}", .{ cp, err });
+                };
             } else {
-                t.setCursorPos(row_idx + 1, col + 2);
+                // Blank cell — print space to advance cursor (cheaper than setCursorPos)
+                t.print(' ') catch {};
             }
         }
         offset += row_bytes;
@@ -269,9 +280,20 @@ fn applyDelta(self: *Daemon, payload: []const u8) void {
 const Message = struct {
     msg_type: Protocol.MessageType,
     payload: []const u8,
+    /// The backing allocation (may be larger than payload). Free with alloc.free().
+    /// Empty slice means no allocation (zero-length payload).
+    payload_buf: []u8,
 };
 
+/// Send a message with write-side mutex held (safe for concurrent callers).
+fn sendMessageLocked(self: *Daemon, msg_type: Protocol.MessageType, payload: []const u8) !void {
+    self.write_mutex.lock();
+    defer self.write_mutex.unlock();
+    try sendMessage(self.fd, msg_type, payload);
+}
+
 fn sendMessage(fd: posix.socket_t, msg_type: Protocol.MessageType, payload: []const u8) !void {
+    // Build header + payload into a single buffer to avoid interleaving
     var header: [Protocol.header_len]u8 = undefined;
     header[0] = Protocol.magic[0];
     header[1] = Protocol.magic[1];
@@ -284,7 +306,7 @@ fn sendMessage(fd: posix.socket_t, msg_type: Protocol.MessageType, payload: []co
     }
 }
 
-fn readMessage(fd: posix.socket_t) !Message {
+fn readMessage(alloc: Allocator, fd: posix.socket_t) !Message {
     var header: [Protocol.header_len]u8 = undefined;
     try readExact(fd, &header);
 
@@ -296,18 +318,15 @@ fn readMessage(fd: posix.socket_t) !Message {
     const payload_len = std.mem.readInt(u32, header[3..7], .little);
 
     if (payload_len == 0) {
-        return .{ .msg_type = msg_type, .payload = &.{} };
+        return .{ .msg_type = msg_type, .payload = &.{}, .payload_buf = &.{} };
     }
 
-    // For simplicity, use a static buffer. Large payloads (FULL_STATE) may
-    // exceed this — a production impl would use dynamic allocation.
-    const S = struct {
-        var buf: [1024 * 1024]u8 = undefined; // 1MB
-    };
-    if (payload_len > S.buf.len) return error.PayloadTooLarge;
-    try readExact(fd, S.buf[0..payload_len]);
+    if (payload_len > Protocol.max_payload_len) return error.PayloadTooLarge;
+    const buf = try alloc.alloc(u8, payload_len);
+    errdefer alloc.free(buf);
+    try readExact(fd, buf);
 
-    return .{ .msg_type = msg_type, .payload = S.buf[0..payload_len] };
+    return .{ .msg_type = msg_type, .payload = buf, .payload_buf = buf };
 }
 
 fn readExact(fd: posix.socket_t, buf: []u8) !void {
@@ -357,12 +376,13 @@ fn connectTcp(addr_str: []const u8) !posix.socket_t {
     return fd;
 }
 
-fn authenticate(fd: posix.socket_t, auth_key: []const u8) !void {
+fn authenticate(alloc: Allocator, fd: posix.socket_t, auth_key: []const u8) !void {
     // Send empty AUTH to request challenge
     try sendMessage(fd, .auth, &.{});
 
     // Read challenge
-    const msg = try readMessage(fd);
+    const msg = try readMessage(alloc, fd);
+    defer alloc.free(msg.payload_buf);
     if (msg.msg_type != .auth_challenge or msg.payload.len != Protocol.challenge_len) {
         return error.AuthFailed;
     }
@@ -376,7 +396,8 @@ fn authenticate(fd: posix.socket_t, auth_key: []const u8) !void {
     try sendMessage(fd, .auth, &mac);
 
     // Read result
-    const result = try readMessage(fd);
+    const result = try readMessage(alloc, fd);
+    defer alloc.free(result.payload_buf);
     if (result.msg_type != .auth_ok) {
         return error.AuthFailed;
     }

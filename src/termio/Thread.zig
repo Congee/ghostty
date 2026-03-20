@@ -376,6 +376,11 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .inject_output_small => |v| io.processOutput(v.data[0..v.len]),
+            .inject_output_alloc => |v| {
+                defer v.alloc.free(v.data);
+                io.processOutput(v.data);
+            },
         }
     }
 

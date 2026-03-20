@@ -82,6 +82,12 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Inject bytes into the terminal's output parser (as if they came
+    /// from the PTY). Used by the status bar to write VT sequences
+    /// safely from the main thread via the IO mailbox.
+    inject_output_small: WriteReq.Small,
+    inject_output_alloc: WriteReq.Alloc,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.
@@ -90,6 +96,16 @@ pub const Message = union(enum) {
             .stable => unreachable,
             .small => |v| Message{ .write_small = v },
             .alloc => |v| Message{ .write_alloc = v },
+        };
+    }
+
+    /// Return an inject-output request. Same as writeReq but routes
+    /// through the terminal parser instead of the PTY.
+    pub fn injectReq(alloc: Allocator, data: anytype) !Message {
+        return switch (try WriteReq.init(alloc, data)) {
+            .stable => unreachable,
+            .small => |v| Message{ .inject_output_small = v },
+            .alloc => |v| Message{ .inject_output_alloc = v },
         };
     }
 

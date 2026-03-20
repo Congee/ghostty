@@ -236,6 +236,10 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         return self.listTabs(resp_buf);
     }
 
+    if (std.mem.startsWith(u8, line, "GET-STATUS-BAR")) {
+        return self.getStatusBar(resp_buf);
+    }
+
     if (std.mem.startsWith(u8, line, "GET-FOCUSED")) {
         return self.getFocused(resp_buf);
     }
@@ -286,6 +290,24 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
         }
     }
     try w.writeByte('"');
+}
+
+/// GET-STATUS-BAR: returns the current status bar text for the focused surface.
+fn getStatusBar(self: *ControlSocket, buf: []u8) []const u8 {
+    const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+
+    surface.renderer_state.mutex.lock();
+    defer surface.renderer_state.mutex.unlock();
+
+    if (surface.renderer_state.status_bar) |sb| {
+        w.writeAll(sb.left) catch return "ERR buffer overflow\n";
+        w.writeByte('\n') catch return "ERR buffer overflow\n";
+    } else {
+        w.writeAll("(none)\n") catch return "ERR buffer overflow\n";
+    }
+    return fbs.getWritten();
 }
 
 /// LIST-TABS: returns JSON array of tab info.

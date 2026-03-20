@@ -152,6 +152,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
+        /// Number of extra rows for the status bar (0 or 1).
+        status_bar_rows: terminal.size.CellCountInt = 0,
+
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -1388,9 +1391,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Render status bar in the bottom padding row
                 if (critical.status_bar_text) |sb_text| {
+                    self.status_bar_rows = 1;
                     self.rebuildStatusBar(sb_text) catch |err| {
                         log.warn("error rebuilding status bar err={}", .{err});
                     };
+                } else {
+                    self.status_bar_rows = 0;
                 }
 
                 // The scrollbar is only emitted during draws so we also
@@ -2336,13 +2342,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
+            // When a status bar is active, allocate one extra row for it.
+            // The status bar row is rendered in the bottom padding area.
+            const effective_rows = state.rows + self.status_bar_rows;
+
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != effective_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = effective_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -3330,16 +3340,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// positioned in the bottom padding area. Reuses the font atlas
         /// and cell rendering pipeline — no shader changes needed.
         fn rebuildStatusBar(self: *Self, text: []const u8) !void {
-            const rows = self.cells.size.rows;
+            // The status bar row is at y = terminal_rows (allocated by
+            // rebuildCells which sizes cells to rows + status_bar_rows).
+            const terminal_rows = self.cells.size.rows - self.status_bar_rows;
             const cols = self.cells.size.columns;
-
-            // Resize to rows+1 to accommodate the status bar row
-            var sb_size = self.cells.size;
-            sb_size.rows = rows + 1;
-            try self.cells.resize(self.alloc, sb_size);
-
-            // Update grid_size so the bg shader includes the extra row
-            self.uniforms.grid_size = .{ cols, rows + 1 };
 
             // Set bg color for the status bar row (reverse video: fg as bg)
             const bg_color: shaderpkg.CellBg = .{
@@ -3349,7 +3353,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 255,
             };
             for (0..cols) |col| {
-                self.cells.bgCell(rows, col).* = bg_color;
+                self.cells.bgCell(terminal_rows, col).* = bg_color;
             }
 
             // Render text glyphs using the shared font atlas
@@ -3370,7 +3374,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 try self.cells.add(self.alloc, .text, .{
                     .atlas = .grayscale,
-                    .grid_pos = .{ x, rows },
+                    .grid_pos = .{ x, terminal_rows },
                     .color = .{ fg_color.r, fg_color.g, fg_color.b, 255 },
                     .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                     .glyph_size = .{ render.glyph.width, render.glyph.height },

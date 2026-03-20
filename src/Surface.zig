@@ -2676,15 +2676,18 @@ pub fn refreshStatusBar(self: *Surface) !void {
     defer text_buf.deinit(self.alloc);
     const w = text_buf.writer(self.alloc);
 
+    // Use app.focused_surface (not self) to determine the active tab.
+    // This ensures all surfaces show the same status bar text, preventing
+    // garbled text during macOS tab switch animations where the old
+    // surface's last frame is briefly visible alongside the new surface.
+    const focused = self.app.focused_surface;
     const surfaces = self.app.surfaces.items;
     var tab_idx: usize = 0;
     for (surfaces) |surf| {
         const core_surface: *Surface = &surf.core_surface;
-        // Skip surfaces that are closing — they will be removed from
-        // the list when ghostty_surface_free runs asynchronously.
         if (core_surface.closing) continue;
         const label = core_surface.session.displayLabel();
-        const is_active = (core_surface == self);
+        const is_active = if (focused) |f| (core_surface == f) else false;
         if (is_active) {
             try w.print(" [{d}:{s}*]", .{ tab_idx, label });
         } else {

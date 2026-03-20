@@ -136,7 +136,7 @@ pub fn runUnixListener(
     acceptLoop(alloc, fd, session_mgr, auth_key);
 }
 
-fn runTcpListener(
+pub fn runTcpListener(
     alloc: Allocator,
     addr_str: []const u8,
     session_mgr: *SessionManager,

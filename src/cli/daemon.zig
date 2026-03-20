@@ -67,7 +67,14 @@ fn getAuthKey() []const u8 {
 }
 
 pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
-    const addr = std.net.Address.initUnix(socket_path) catch return false;
+    if (std.mem.startsWith(u8, socket_path, "tcp:")) {
+        return isDaemonRunningTcp(socket_path["tcp:".len..]);
+    }
+    const path = if (std.mem.startsWith(u8, socket_path, "unix:"))
+        socket_path["unix:".len..]
+    else
+        socket_path;
+    const addr = std.net.Address.initUnix(path) catch return false;
     const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
     defer posix.close(fd);
     posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
@@ -89,6 +96,33 @@ pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
         total += n;
     }
 
+    return hdr[0] == 'G' and hdr[1] == 'S';
+}
+
+fn isDaemonRunningTcp(addr_str: []const u8) bool {
+    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return false;
+    const host = addr_str[0..colon];
+    const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch return false;
+    const addr = std.net.Address.resolveIp(host, port) catch return false;
+    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM, 0) catch return false;
+    defer posix.close(fd);
+    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+
+    const probe = [_]u8{ 'G', 'S', 0x02, 0, 0, 0, 0 };
+    var sent: usize = 0;
+    while (sent < probe.len) {
+        const n = posix.write(fd, probe[sent..]) catch return false;
+        if (n == 0) return false;
+        sent += n;
+    }
+
+    var hdr: [7]u8 = undefined;
+    var total: usize = 0;
+    while (total < hdr.len) {
+        const n = posix.read(fd, hdr[total..]) catch return false;
+        if (n == 0) return false;
+        total += n;
+    }
     return hdr[0] == 'G' and hdr[1] == 'S';
 }
 
@@ -138,10 +172,21 @@ fn startDaemon(socket_path: []const u8) !void {
         var session_mgr = SessionManager.init(daemon_alloc);
 
         const auth_key = getAuthKey();
-        std.fs.cwd().deleteFile(socket_path) catch {};
-        daemon_main.runUnixListener(daemon_alloc, socket_path, &session_mgr, auth_key) catch |err| {
-            std.log.err("daemon listener failed: {}", .{err});
-        };
+        if (std.mem.startsWith(u8, socket_path, "tcp:")) {
+            const addr_str = socket_path["tcp:".len..];
+            daemon_main.runTcpListener(daemon_alloc, addr_str, &session_mgr, auth_key) catch |err| {
+                std.log.err("daemon tcp listener failed: {}", .{err});
+            };
+        } else {
+            const path = if (std.mem.startsWith(u8, socket_path, "unix:"))
+                socket_path["unix:".len..]
+            else
+                socket_path;
+            std.fs.cwd().deleteFile(path) catch {};
+            daemon_main.runUnixListener(daemon_alloc, path, &session_mgr, auth_key) catch |err| {
+                std.log.err("daemon unix listener failed: {}", .{err});
+            };
+        }
 
         session_mgr.deinit();
     }

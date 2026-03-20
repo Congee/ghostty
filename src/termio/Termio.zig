@@ -64,9 +64,10 @@ mailbox: termio.Mailbox,
 terminal_stream: StreamHandler.Stream,
 
 /// Pre-built VT escape bytes for the status bar. Re-injected after
-/// every processOutput to keep the status bar visible. Updated via
+/// processOutput when enough time has elapsed. Updated via
 /// the set_status_bar mailbox message from the main thread.
 status_bar_vt: ?[]const u8 = null,
+status_bar_last_inject: ?std.time.Instant = null,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -764,10 +765,20 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.nextSlice(buf);
     }
 
-    // Re-inject the status bar after processing output so it stays
-    // visible even if the shell resets DECSTBM or scrolls.
+    // Re-inject the status bar, throttled to avoid visual glitches
+    // during rapid output (shell startup, scrolling, etc.).
     if (self.status_bar_vt) |vt_bytes| {
-        self.terminal_stream.nextSlice(vt_bytes);
+        const should_inject = if (std.time.Instant.now()) |now| blk: {
+            if (self.status_bar_last_inject) |last| {
+                break :blk now.since(last) >= (200 * std.time.ns_per_ms);
+            }
+            break :blk true;
+        } else |_| true;
+
+        if (should_inject) {
+            self.terminal_stream.nextSlice(vt_bytes);
+            self.status_bar_last_inject = std.time.Instant.now() catch null;
+        }
     }
 
     // If our stream handling caused messages to be sent to the mailbox

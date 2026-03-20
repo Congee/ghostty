@@ -1,4 +1,4 @@
-#if os(iOS)
+#if os(iOS) || os(macOS)
 // GSPClient — Swift implementation of the GSP (Ghostty Sync Protocol) client.
 // Connects to a ghostty-daemon over TCP or Unix socket, handles auth,
 // and provides async session management.
@@ -8,6 +8,8 @@ import Network
 import CryptoKit
 #if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
 #endif
 
 /// GSP message types matching Protocol.zig MessageType enum.
@@ -499,15 +501,17 @@ class GSPClient: ObservableObject {
     }
 
     private func handleClipboard(_ data: Data) {
-        #if os(iOS)
         if let str = String(data: data, encoding: .utf8) {
-            // Decode base64 clipboard content
             if let decoded = Data(base64Encoded: str),
                let text = String(data: decoded, encoding: .utf8) {
+                #if os(iOS)
                 UIPasteboard.general.string = text
+                #elseif os(macOS)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                #endif
             }
         }
-        #endif
     }
 }
 #endif

@@ -62,6 +62,10 @@ pub fn getSocketPath() []const u8 {
     return std.posix.getenv("GHOSTTY_SOCKET") orelse default_socket;
 }
 
+fn getAuthKey() []const u8 {
+    return std.posix.getenv("GHOSTTY_AUTH_KEY") orelse "";
+}
+
 pub fn isDaemonRunning(_: Allocator, socket_path: []const u8) bool {
     const addr = std.net.Address.initUnix(socket_path) catch return false;
     const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
@@ -133,8 +137,9 @@ fn startDaemon(socket_path: []const u8) !void {
         const SessionManager = @import("../daemon/SessionManager.zig");
         var session_mgr = SessionManager.init(daemon_alloc);
 
+        const auth_key = getAuthKey();
         std.fs.cwd().deleteFile(socket_path) catch {};
-        daemon_main.runUnixListener(daemon_alloc, socket_path, &session_mgr, "") catch |err| {
+        daemon_main.runUnixListener(daemon_alloc, socket_path, &session_mgr, auth_key) catch |err| {
             std.log.err("daemon listener failed: {}", .{err});
         };
 

@@ -1,4 +1,4 @@
-#if os(iOS)
+#if os(iOS) || os(macOS)
 // BonjourBrowser — Discovers ghostty-daemon instances on the local network
 // using Network.framework's NWBrowser (Bonjour/DNS-SD).
 

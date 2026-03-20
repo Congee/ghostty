@@ -23,9 +23,9 @@ pkill -f Ghostty 2>/dev/null || true
 sleep 1
 rm -f /tmp/ghostty-ctl-*.sock
 
-# Launch ghostty directly (not via `open`) so stderr is captured
-GHOSTTY_LOG=1 "$BINARY" 2>/tmp/ghostty-e2e.log &
-GHOSTTY_PID=$!
+# Launch via open (required for macOS NSApplication)
+open "$APP"
+GHOSTTY_PID=""
 
 # Wait for control socket to appear (up to 10s)
 SOCKET=""
@@ -169,8 +169,7 @@ assert_contains "GET-FOCUSED returns tabs count" '"tabs":' "$RESP"
 # Cleanup
 echo ""
 echo "Cleaning up..."
-kill $GHOSTTY_PID 2>/dev/null || true
-wait $GHOSTTY_PID 2>/dev/null || true
+pkill -f Ghostty 2>/dev/null || true
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -3329,9 +3329,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Render the status bar as an extra row of cells at y=rows,
         /// positioned in the bottom padding area. Reuses the font atlas
         /// and cell rendering pipeline — no shader changes needed.
-        /// Render the status bar as an extra row of cells at y=rows,
-        /// positioned in the bottom padding area. Reuses the font atlas
-        /// and cell rendering pipeline — no shader changes needed.
         fn rebuildStatusBar(self: *Self, text: []const u8) !void {
             const rows = self.cells.size.rows;
             const cols = self.cells.size.columns;

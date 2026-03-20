@@ -88,10 +88,6 @@ pub const Message = union(enum) {
     inject_output_small: WriteReq.Small,
     inject_output_alloc: WriteReq.Alloc,
 
-    /// Update the persistent status bar VT bytes. These are re-injected
-    /// after every processOutput to keep the status bar visible.
-    /// The alloc data becomes owned by Termio (freed on next update).
-    set_status_bar: WriteReq.Alloc,
 
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT

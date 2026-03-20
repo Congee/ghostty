@@ -1159,6 +1159,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                status_bar_text: ?[]const u8,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1270,12 +1271,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
+                // Read status bar text under lock
+                const sb_text: ?[]const u8 = sb: {
+                    const sb = state.status_bar orelse break :sb null;
+                    if (sb.left.len == 0) break :sb null;
+                    break :sb try arena_alloc.dupe(u8, sb.left);
+                };
+
                 break :critical .{
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .status_bar_text = sb_text,
                 };
             };
 
@@ -1376,6 +1385,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
+
+                // Render status bar in the bottom padding row
+                if (critical.status_bar_text) |sb_text| {
+                    self.rebuildStatusBar(sb_text) catch |err| {
+                        log.warn("error rebuilding status bar err={}", .{err});
+                    };
+                }
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -3308,6 +3324,67 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_y),
                 },
             }, cursor_style);
+        }
+
+        /// Render the status bar as an extra row of cells at y=rows,
+        /// positioned in the bottom padding area. Reuses the font atlas
+        /// and cell rendering pipeline — no shader changes needed.
+        /// Render the status bar as an extra row of cells at y=rows,
+        /// positioned in the bottom padding area. Reuses the font atlas
+        /// and cell rendering pipeline — no shader changes needed.
+        fn rebuildStatusBar(self: *Self, text: []const u8) !void {
+            const rows = self.cells.size.rows;
+            const cols = self.cells.size.columns;
+
+            // Resize to rows+1 to accommodate the status bar row
+            var sb_size = self.cells.size;
+            sb_size.rows = rows + 1;
+            try self.cells.resize(self.alloc, sb_size);
+
+            // Update grid_size so the bg shader includes the extra row
+            self.uniforms.grid_size = .{ cols, rows + 1 };
+
+            // Set bg color for the status bar row (reverse video: fg as bg)
+            const bg_color: shaderpkg.CellBg = .{
+                self.config.foreground.r,
+                self.config.foreground.g,
+                self.config.foreground.b,
+                255,
+            };
+            for (0..cols) |col| {
+                self.cells.bgCell(rows, col).* = bg_color;
+            }
+
+            // Render text glyphs using the shared font atlas
+            const fg_color = self.config.background;
+            var x: u16 = 0;
+            for (text) |byte| {
+                if (x >= cols) break;
+                if (byte < 0x20) continue; // skip control chars
+
+                const render_ = self.font_grid.renderCodepoint(
+                    self.alloc,
+                    @intCast(byte),
+                    .regular,
+                    .text,
+                    .{ .grid_metrics = self.grid_metrics },
+                ) catch continue;
+                const render = render_ orelse continue;
+
+                try self.cells.add(self.alloc, .text, .{
+                    .atlas = .grayscale,
+                    .grid_pos = .{ x, rows },
+                    .color = .{ fg_color.r, fg_color.g, fg_color.b, 255 },
+                    .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                    .glyph_size = .{ render.glyph.width, render.glyph.height },
+                    .bearings = .{
+                        @intCast(render.glyph.offset_x),
+                        @intCast(render.glyph.offset_y),
+                    },
+                });
+
+                x += 1;
+            }
         }
 
         fn addPreeditCell(

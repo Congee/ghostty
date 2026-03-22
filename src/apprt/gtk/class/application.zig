@@ -1549,13 +1549,16 @@ pub const Application = extern struct {
         core_app.colorSchemeEvent(self.rt(), scheme) catch |err| {
             log.warn("error updating app color scheme err={}", .{err});
         };
-        for (core_app.surfaces.items) |surface| {
-            surface.core().colorSchemeCallback(scheme) catch |err| {
-                log.warn(
-                    "unable to tell surface about color scheme change err={}",
-                    .{err},
-                );
-            };
+        for (core_app.tabs.items) |tab| {
+            var iter = tab.surfaceIterator();
+            while (iter.next()) |surface| {
+                surface.core().colorSchemeCallback(scheme) catch |err| {
+                    log.warn(
+                        "unable to tell surface about color scheme change err={}",
+                        .{err},
+                    );
+                };
+            }
         }
 
         if (gtk_version.atLeast(4, 20, 0)) {

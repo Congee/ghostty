@@ -159,8 +159,7 @@
                                     <action selector="newWindow:" target="-1" id="pnf-fE-gHi"/>
                                 </connections>
                             </menuItem>
-                            <menuItem title="New Tab" id="uTG-Vz-hJU">
-                                <modifierMask key="keyEquivalentModifierMask"/>
+                            <menuItem title="New Tab" keyEquivalent="t" id="uTG-Vz-hJU">
                                 <connections>
                                     <action selector="newTab:" target="-1" id="KoW-K7-hw5"/>
                                 </connections>

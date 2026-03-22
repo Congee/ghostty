@@ -507,7 +507,8 @@ extension Ghostty {
                 toggleFullscreen(app, target: target, mode: action.action.toggle_fullscreen)
 
             case GHOSTTY_ACTION_MOVE_TAB:
-                return moveTab(app, target: target, move: action.action.move_tab)
+                Ghostty.logger.info("move_tab is not supported without native tabs")
+                return false
 
             case GHOSTTY_ACTION_GOTO_TAB:
                 return gotoTab(app, target: target, tab: action.action.goto_tab)
@@ -820,16 +821,6 @@ extension Ghostty {
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
                 guard let appState = self.appState(fromView: surfaceView) else { return }
-                guard appState.config.windowDecorations else {
-                    let alert = NSAlert()
-                    alert.messageText = "Tabs are disabled"
-                    alert.informativeText = "Enable window decorations to use tabs"
-                    alert.addButton(withTitle: "OK")
-                    alert.alertStyle = .warning
-                    _ = alert.runModal()
-                    return
-                }
-
                 NotificationCenter.default.post(
                     name: Notification.ghosttyNewTab,
                     object: surfaceView,
@@ -911,24 +902,9 @@ extension Ghostty {
                         name: .ghosttyCloseTab,
                         object: surfaceView
                     )
-                    return
-
-                case GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER:
-                    NotificationCenter.default.post(
-                        name: .ghosttyCloseOtherTabs,
-                        object: surfaceView
-                    )
-                    return
-
-                case GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT:
-                    NotificationCenter.default.post(
-                        name: .ghosttyCloseTabsOnTheRight,
-                        object: surfaceView
-                    )
-                    return
 
                 default:
-                    assertionFailure()
+                    Ghostty.logger.info("unsupported close tab mode=\(mode.rawValue)")
                 }
 
             default:
@@ -1090,37 +1066,6 @@ extension Ghostty {
             }
         }
 
-        private static func moveTab(
-            _ app: ghostty_app_t,
-            target: ghostty_target_s,
-            move: ghostty_action_move_tab_s) -> Bool {
-                switch target.tag {
-                case GHOSTTY_TARGET_APP:
-                    Ghostty.logger.warning("move tab does nothing with an app target")
-                    return false
-
-                case GHOSTTY_TARGET_SURFACE:
-                    guard let surface = target.target.surface else { return false }
-                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
-
-                    // See gotoTab for notes on this check.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
-
-                    NotificationCenter.default.post(
-                        name: .ghosttyMoveTab,
-                        object: surfaceView,
-                        userInfo: [
-                            SwiftUI.Notification.Name.GhosttyMoveTabKey: Action.MoveTab(c: move),
-                        ]
-                    )
-
-                default:
-                    assertionFailure()
-                }
-
-                return true
-        }
-
         private static func gotoTab(
             _ app: ghostty_app_t,
             target: ghostty_target_s,
@@ -1134,9 +1079,9 @@ extension Ghostty {
                     guard let surface = target.target.surface else { return false }
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
-                    // Similar to goto_split (see comment there) about our performability,
-                    // we should make this more accurate later.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    // Check in-window tabs count
+                    guard let controller = surfaceView.window?.windowController as? BaseTerminalController,
+                          controller.tabs.count > 1 else { return false }
 
                     NotificationCenter.default.post(
                         name: Notification.ghosttyGotoTab,

@@ -317,6 +317,17 @@ pub const App = struct {
                 },
             },
 
+            // Capture split direction before it's forwarded to the embedder,
+            // so addSurface(.split) knows which direction to use.
+            .new_split => {
+                self.core_app.pending_split_direction = switch (value) {
+                    .left => .left,
+                    .right => .right,
+                    .up => .up,
+                    .down => .down,
+                };
+            },
+
             else => {},
         }
     }
@@ -460,6 +471,11 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Initial pixel size. Set to actual window dimensions to avoid
+        /// resize flash when creating tabs. Defaults to 800x600.
+        initial_width: u32 = 800,
+        initial_height: u32 = 600,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -472,12 +488,12 @@ pub const Surface = struct {
                 .x = @floatCast(opts.scale_factor),
                 .y = @floatCast(opts.scale_factor),
             },
-            .size = .{ .width = 800, .height = 600 },
+            .size = .{ .width = opts.initial_width, .height = opts.initial_height },
             .cursor_pos = .{ .x = -1, .y = -1 },
         };
 
         // Add ourselves to the list of surfaces on the app.
-        try app.core_app.addSurface(self);
+        try app.core_app.addSurface(self, opts.context);
         errdefer app.core_app.deleteSurface(self);
 
         // Shallow copy the config so that we can modify it.
@@ -1543,6 +1559,122 @@ pub const CAPI = struct {
         };
     }
 
+    // ------------------------------------------------------------------
+    // Tab and split tree C API
+    // ------------------------------------------------------------------
+
+    const TreeNode = CoreApp.SurfaceSplitTree.Node;
+
+    /// Look up the tab at the given index, or null if out of bounds.
+    fn tabAt(v: *App, tab_idx: u32) ?*const CoreApp.Tab {
+        const tabs = v.core_app.tabs.items;
+        if (tab_idx >= tabs.len) return null;
+        return &tabs[tab_idx];
+    }
+
+    /// Look up the tree node at the given tab/handle, or null if out of bounds.
+    fn nodeAt(v: *App, tab_idx: u32, handle: u16) ?TreeNode {
+        const tab = tabAt(v, tab_idx) orelse return null;
+        if (handle >= tab.tree.nodes.len) return null;
+        return tab.tree.nodes[handle];
+    }
+
+    /// Returns the number of tabs.
+    export fn ghostty_app_tab_count(v: *App) u32 {
+        return @intCast(v.core_app.tabs.items.len);
+    }
+
+    /// Returns the tab ID at the given index.
+    export fn ghostty_app_tab_id_at(v: *App, index: u32) u32 {
+        const tab = tabAt(v, index) orelse return 0;
+        return tab.id;
+    }
+
+    /// Returns the index of the tab containing the focused surface, or -1.
+    export fn ghostty_app_active_tab_index(v: *App) i32 {
+        const focused = v.core_app.focusedSurface() orelse return -1;
+        for (v.core_app.tabs.items, 0..) |*tab, i| {
+            var iter = tab.surfaceIterator();
+            while (iter.next()) |s| {
+                if (s.core() == focused) return @intCast(i);
+            }
+        }
+        return -1;
+    }
+
+    /// Returns the tree version for change detection (SwiftUI).
+    export fn ghostty_app_tab_tree_version(v: *App, tab_idx: u32) u64 {
+        const tab = tabAt(v, tab_idx) orelse return 0;
+        return tab.tree_version;
+    }
+
+    /// Returns true if the node at the given handle is a leaf.
+    export fn ghostty_app_tab_node_is_leaf(v: *App, tab_idx: u32, handle: u16) bool {
+        const node = nodeAt(v, tab_idx, handle) orelse return false;
+        return node == .leaf;
+    }
+
+    /// Returns the surface pointer for a leaf node, or null.
+    export fn ghostty_app_tab_node_surface(v: *App, tab_idx: u32, handle: u16) ?*Surface {
+        const node = nodeAt(v, tab_idx, handle) orelse return null;
+        return switch (node) {
+            .leaf => |view| view.surface,
+            .split => null,
+        };
+    }
+
+    /// Returns the left child handle of a split node.
+    export fn ghostty_app_tab_node_left(v: *App, tab_idx: u32, handle: u16) u16 {
+        const node = nodeAt(v, tab_idx, handle) orelse return 0;
+        return switch (node) {
+            .split => |s| @intFromEnum(s.left),
+            .leaf => 0,
+        };
+    }
+
+    /// Returns the right child handle of a split node.
+    export fn ghostty_app_tab_node_right(v: *App, tab_idx: u32, handle: u16) u16 {
+        const node = nodeAt(v, tab_idx, handle) orelse return 0;
+        return switch (node) {
+            .split => |s| @intFromEnum(s.right),
+            .leaf => 0,
+        };
+    }
+
+    /// Returns true if the split is horizontal (left/right), false if vertical (up/down).
+    export fn ghostty_app_tab_node_is_horizontal(v: *App, tab_idx: u32, handle: u16) bool {
+        const node = nodeAt(v, tab_idx, handle) orelse return false;
+        return switch (node) {
+            .split => |s| s.layout == .horizontal,
+            .leaf => false,
+        };
+    }
+
+    /// Returns the split ratio.
+    export fn ghostty_app_tab_node_ratio(v: *App, tab_idx: u32, handle: u16) f64 {
+        const node = nodeAt(v, tab_idx, handle) orelse return 0.5;
+        return switch (node) {
+            .split => |s| @floatCast(s.ratio),
+            .leaf => 0.5,
+        };
+    }
+
+    /// Returns true if the tab has a zoomed split.
+    export fn ghostty_app_tab_is_zoomed(v: *App, tab_idx: u32) bool {
+        const tab = tabAt(v, tab_idx) orelse return false;
+        return tab.tree.zoomed != null;
+    }
+
+    /// Returns the number of nodes in the tab's tree.
+    export fn ghostty_app_tab_node_count(v: *App, tab_idx: u32) u16 {
+        const tab = tabAt(v, tab_idx) orelse return 0;
+        return @intCast(tab.tree.nodes.len);
+    }
+
+    // ------------------------------------------------------------------
+    // Surface creation and lifecycle
+    // ------------------------------------------------------------------
+
     /// Returns initial surface options.
     export fn ghostty_surface_config_new() apprt.Surface.Options {
         return .{};
@@ -1607,6 +1739,11 @@ pub const CAPI = struct {
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.session.child_exited;
+    }
+
+    /// Returns the tab ID for this surface (assigned by the Zig core).
+    export fn ghostty_surface_tab_id(surface: *Surface) u32 {
+        return surface.app.core_app.tabIdForSurface(&surface.core_surface);
     }
 
     /// Returns true if the surface has a selection.

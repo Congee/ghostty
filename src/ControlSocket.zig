@@ -206,38 +206,26 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
     }
 
     if (std.mem.startsWith(u8, line, "CLEAR-STATUS")) {
-        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-        try surface.setStatusBar(null, null);
+        self.app.status_bar.send(.{ .clear_text = {} });
+        self.wakeRenderers();
         return "OK\n";
     }
 
     if (std.mem.startsWith(u8, line, "SET-STATUS-LEFT ")) {
-        const text = line["SET-STATUS-LEFT ".len..];
-        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-        try surface.setStatusBar(text, null);
-        return "OK\n";
+        return self.sendSetText(line["SET-STATUS-LEFT ".len..], null);
     }
 
     if (std.mem.startsWith(u8, line, "SET-STATUS-RIGHT ")) {
-        const text = line["SET-STATUS-RIGHT ".len..];
-        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-        try surface.setStatusBar(null, text);
-        return "OK\n";
+        return self.sendSetText(null, line["SET-STATUS-RIGHT ".len..]);
     }
 
     if (std.mem.startsWith(u8, line, "SET-STATUS ")) {
         const text = line["SET-STATUS ".len..];
-        // Split on " | "
         if (std.mem.indexOf(u8, text, " | ")) |idx| {
-            const left = text[0..idx];
-            const right = text[idx + 3 ..];
-            const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-            try surface.setStatusBar(left, right);
+            return self.sendSetText(text[0..idx], text[idx + 3 ..]);
         } else {
-            const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-            try surface.setStatusBar(text, null);
+            return self.sendSetText(text, null);
         }
-        return "OK\n";
     }
 
     if (std.mem.startsWith(u8, line, "LIST-SESSIONS")) {
@@ -259,19 +247,24 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
 
     if (std.mem.startsWith(u8, line, "SET-COMPONENTS ")) {
         const json = line["SET-COMPONENTS ".len..];
-        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
         const components = parseComponents(self.alloc, json) catch return "ERR invalid JSON\n";
-        surface.setComponents(components.zone, components.source, components.items) catch {
-            freeComponents(self.alloc, components.items);
-            return "ERR failed to set components\n";
-        };
+        // Send directly to the App's StatusBar — no per-surface queue.
+        self.app.status_bar.send(.{ .set_components = .{
+            .zone = components.zone,
+            .source = components.source,
+            .items = components.items,
+        } });
+        self.wakeRenderers();
         return "OK\n";
     }
 
     if (std.mem.startsWith(u8, line, "CLEAR-COMPONENTS ")) {
         const source = line["CLEAR-COMPONENTS ".len..];
-        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
-        surface.clearComponents(source) catch {};
+        const source_dup = self.alloc.dupe(u8, source) catch return "ERR alloc failed\n";
+        self.app.status_bar.send(.{ .clear_components = .{
+            .source = source_dup,
+        } });
+        self.wakeRenderers();
         return "OK\n";
     }
 
@@ -279,7 +272,7 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         const name = line["RENAME-TAB ".len..];
         const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
         surface.session.setName(name) catch return "ERR alloc failed\n";
-        surface.refreshStatusBar() catch {};
+        self.app.sendTabsUpdate();
         return "OK\n";
     }
 
@@ -305,22 +298,41 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// GET-STATUS-BAR: returns the current status bar text for the focused surface.
+/// GET-STATUS-BAR: returns the current status bar text from the App's StatusBar.
 fn getStatusBar(self: *ControlSocket, buf: []u8) []const u8 {
-    const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
 
-    surface.renderer_state.mutex.lock();
-    defer surface.renderer_state.mutex.unlock();
-
-    if (surface.renderer_state.status_bar) |sb| {
-        w.writeAll(sb.left) catch return "ERR buffer overflow\n";
+    const sb = &self.app.status_bar;
+    if (sb.hasContent()) {
+        if (sb.left_text.len > 0) {
+            w.writeAll(sb.left_text) catch return "ERR buffer overflow\n";
+        }
         w.writeByte('\n') catch return "ERR buffer overflow\n";
     } else {
         w.writeAll("(none)\n") catch return "ERR buffer overflow\n";
     }
     return fbs.getWritten();
+}
+
+/// Dupe and send a set_text message to the App's StatusBar.
+fn sendSetText(self: *ControlSocket, left: ?[]const u8, right: ?[]const u8) []const u8 {
+    const left_dup = if (left) |l| self.alloc.dupe(u8, l) catch return "ERR alloc failed\n" else null;
+    const right_dup = if (right) |r| self.alloc.dupe(u8, r) catch {
+        if (left_dup) |ld| self.alloc.free(ld);
+        return "ERR alloc failed\n";
+    } else null;
+    self.app.status_bar.send(.{ .set_text = .{
+        .left = left_dup,
+        .right = right_dup,
+    } });
+    self.wakeRenderers();
+    return "OK\n";
+}
+
+/// Wake all renderer threads so they pick up status bar changes.
+fn wakeRenderers(self: *ControlSocket) void {
+    self.app.wakeRenderers();
 }
 
 /// LIST-TABS: returns JSON array of tab info.
@@ -332,11 +344,10 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
     w.writeByte('[') catch return "ERR buffer overflow\n";
 
     var tab_idx: usize = 0;
-    for (self.app.surfaces.items) |surf| {
-        const core = &surf.core_surface;
-        if (core.closing) continue;
+    for (self.app.tabs.items) |tab| {
+        const core = tab.representativeSurface() orelse continue;
         const label = core.session.displayLabel();
-        const is_active = if (focused) |f| (core == f) else false;
+        const is_active = if (focused) |f| tab.containsSurface(f) else false;
 
         if (tab_idx > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
         std.fmt.format(w, "{{\"index\":{d},\"title\":", .{tab_idx}) catch return "ERR buffer overflow\n";
@@ -355,13 +366,12 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
 fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
 
-    // Find the index of the focused surface (excluding closing ones)
+    // Find the tab index of the focused surface
     var idx: usize = 0;
     var tab_count: usize = 0;
-    for (self.app.surfaces.items) |surf| {
-        const core = &surf.core_surface;
-        if (core.closing) continue;
-        if (core == surface) idx = tab_count;
+    for (self.app.tabs.items) |tab| {
+        if (tab.representativeSurface() == null) continue;
+        if (tab.containsSurface(surface)) idx = tab_count;
         tab_count += 1;
     }
 

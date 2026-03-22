@@ -3353,7 +3353,7 @@ pub const Surface = extern struct {
         errdefer alloc.destroy(surface);
 
         // Add ourselves to the list of surfaces on the app.
-        try app.core().addSurface(self.rt());
+        try app.core().addSurface(self.rt(), priv.context);
         errdefer app.core().deleteSurface(self.rt());
 
         // Initialize our surface configuration.

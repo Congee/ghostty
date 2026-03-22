@@ -152,9 +152,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-        /// Number of extra rows for the status bar (0 or 1).
-        status_bar_rows: terminal.size.CellCountInt = 0,
-
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
 
@@ -1162,7 +1159,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
-                status_bar_text: ?[]const u8,
+                status_bar_segments: []const StatusSegment,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1176,6 +1173,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 state.mutex.lock();
                 defer state.mutex.unlock();
+
+                // Drain any pending status bar updates from the App's StatusBar.
+                if (state.app_status_bar) |sb| sb.drain();
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1274,11 +1274,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
-                // Read status bar text under lock
-                const sb_text: ?[]const u8 = sb: {
-                    const sb = state.status_bar orelse break :sb null;
-                    if (sb.left.len == 0) break :sb null;
-                    break :sb try arena_alloc.dupe(u8, sb.left);
+                // Build styled segments from the App's StatusBar.
+                const sb_segments: []const StatusSegment = sb: {
+                    const sb = state.app_status_bar orelse break :sb &.{};
+                    if (!sb.hasContent()) break :sb &.{};
+                    const app_segs = sb.buildSegments(arena_alloc);
+                    // Convert StatusBar.Segment to our local StatusSegment
+                    var segs: std.ArrayListUnmanaged(StatusSegment) = .empty;
+                    for (app_segs) |seg| {
+                        segs.append(arena_alloc, .{
+                            .text = seg.text,
+                            .fg = seg.fg,
+                            .bg = seg.bg,
+                            .bold = seg.bold,
+                        }) catch {};
+                    }
+                    break :sb segs.items;
                 };
 
                 break :critical .{
@@ -1287,7 +1298,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
-                    .status_bar_text = sb_text,
+                    .status_bar_segments = sb_segments,
                 };
             };
 
@@ -1389,14 +1400,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
 
-                // Render status bar in the bottom padding row
-                if (critical.status_bar_text) |sb_text| {
-                    self.status_bar_rows = 1;
-                    self.rebuildStatusBar(sb_text) catch |err| {
+                // Render status bar over the last terminal row (like tmux).
+                if (critical.status_bar_segments.len > 0) {
+                    self.rebuildStatusBar(critical.status_bar_segments) catch |err| {
                         log.warn("error rebuilding status bar err={}", .{err});
                     };
-                } else {
-                    self.status_bar_rows = 0;
                 }
 
                 // The scrollbar is only emitted during draws so we also
@@ -2342,9 +2350,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
-            // When a status bar is active, allocate one extra row for it.
-            // The status bar row is rendered in the bottom padding area.
-            const effective_rows = state.rows + self.status_bar_rows;
+            // The status bar uses the last terminal row (like tmux),
+            // so effective_rows matches state.rows — no extra allocation.
+            const effective_rows = state.rows;
 
             const grid_size_diff =
                 self.cells.size.rows != effective_rows or
@@ -2359,6 +2367,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update our uniforms accordingly, otherwise
                 // our background cells will be out of place.
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
+
+                // Keep grid_padding in sync with the new cell count,
+                // otherwise the shader miscalculates cell positions.
+                self.updateScreenSizeUniforms();
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
@@ -3339,57 +3351,80 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Render the status bar as an extra row of cells at y=rows,
         /// positioned in the bottom padding area. Reuses the font atlas
         /// and cell rendering pipeline — no shader changes needed.
-        fn rebuildStatusBar(self: *Self, text: []const u8) !void {
-            // The status bar row is at y = terminal_rows (allocated by
-            // rebuildCells which sizes cells to rows + status_bar_rows).
-            const terminal_rows = self.cells.size.rows - self.status_bar_rows;
+        /// A styled segment for the status bar.
+        const StatusSegment = struct {
+            text: []const u8,
+            fg: ?[3]u8 = null,
+            bg: ?[3]u8 = null,
+            bold: bool = false,
+        };
+
+        fn rebuildStatusBar(self: *Self, segments: []const StatusSegment) !void {
+            // The status bar uses the last row of the grid (like tmux).
+            // No extra row is allocated — we overwrite the last terminal row.
+            const status_row = self.cells.size.rows - 1;
             const cols = self.cells.size.columns;
 
             // Clear the status bar row's text cells from the previous frame.
-            // Without this, incremental rebuilds (non-full dirty) leave old
-            // text glyphs in the buffer, causing garbled overlapping text.
-            self.cells.clear(terminal_rows);
+            self.cells.clear(status_row);
 
-            // Set bg color for the status bar row (reverse video: fg as bg)
-            const bg_color: shaderpkg.CellBg = .{
-                self.config.foreground.r,
-                self.config.foreground.g,
-                self.config.foreground.b,
-                255,
-            };
+            // Status bar bg: use alpha 0 so the terminal's uniform background
+            // (which already has the correct background-opacity) shows through.
+            const default_bg: shaderpkg.CellBg = .{ 0, 0, 0, 0 };
             for (0..cols) |col| {
-                self.cells.bgCell(terminal_rows, col).* = bg_color;
+                self.cells.bgCell(status_row, col).* = default_bg;
             }
 
-            // Render text glyphs using the shared font atlas
-            const fg_color = self.config.background;
-            var x: u16 = 0;
-            for (text) |byte| {
-                if (x >= cols) break;
-                if (byte < 0x20) continue; // skip control chars
+            // Compute total text width for centering
+            const default_fg = self.config.foreground;
+            var total_width: u16 = 0;
+            for (segments) |seg| {
+                const wv = std.unicode.Utf8View.initUnchecked(seg.text);
+                var wi = wv.iterator();
+                while (wi.nextCodepoint()) |cp| {
+                    if (cp < 0x20) continue;
+                    total_width +|= 1;
+                }
+            }
+            var x: u16 = if (total_width < cols) (cols - total_width) / 2 else 0;
 
-                const render_ = self.font_grid.renderCodepoint(
-                    self.alloc,
-                    @intCast(byte),
-                    .regular,
-                    .text,
-                    .{ .grid_metrics = self.grid_metrics },
-                ) catch continue;
-                const render = render_ orelse continue;
+            // Render each segment (bg + glyph in a single pass per segment).
+            for (segments) |seg| {
+                const fg_r, const fg_g, const fg_b = if (seg.fg) |f| .{ f[0], f[1], f[2] } else .{ default_fg.r, default_fg.g, default_fg.b };
+                const font_style: font.Style = if (seg.bold) .bold else .regular;
+                const seg_bg: ?shaderpkg.CellBg = if (seg.bg) |bg| .{ bg[0], bg[1], bg[2], 255 } else null;
 
-                try self.cells.add(self.alloc, .text, .{
-                    .atlas = .grayscale,
-                    .grid_pos = .{ x, terminal_rows },
-                    .color = .{ fg_color.r, fg_color.g, fg_color.b, 255 },
-                    .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
-                    .glyph_size = .{ render.glyph.width, render.glyph.height },
-                    .bearings = .{
-                        @intCast(render.glyph.offset_x),
-                        @intCast(render.glyph.offset_y),
-                    },
-                });
+                const view = std.unicode.Utf8View.initUnchecked(seg.text);
+                var it = view.iterator();
+                while (it.nextCodepoint()) |cp| {
+                    if (x >= cols) break;
+                    if (cp < 0x20) continue;
 
-                x += 1;
+                    if (seg_bg) |bg| self.cells.bgCell(status_row, x).* = bg;
+
+                    const render_ = self.font_grid.renderCodepoint(
+                        self.alloc,
+                        cp,
+                        font_style,
+                        .text,
+                        .{ .grid_metrics = self.grid_metrics },
+                    ) catch continue;
+                    const render = render_ orelse continue;
+
+                    try self.cells.add(self.alloc, .text, .{
+                        .atlas = .grayscale,
+                        .grid_pos = .{ x, status_row },
+                        .color = .{ fg_r, fg_g, fg_b, 255 },
+                        .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                        .glyph_size = .{ render.glyph.width, render.glyph.height },
+                        .bearings = .{
+                            @intCast(render.glyph.offset_x),
+                            @intCast(render.glyph.offset_y),
+                        },
+                    });
+
+                    x += 1;
+                }
             }
         }
 

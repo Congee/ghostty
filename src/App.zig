@@ -14,22 +14,130 @@ const input = @import("input.zig");
 const configpkg = @import("config.zig");
 const Config = configpkg.Config;
 const BlockingQueue = @import("datastruct/main.zig").BlockingQueue;
+const SplitTreeMod = @import("datastruct/main.zig").SplitTree;
 const renderer = @import("renderer.zig");
 const rendererpkg = renderer;
 const termio = @import("termio.zig");
 const font = @import("font/main.zig");
 const ControlSocket = @import("ControlSocket.zig");
+const StatusBar = @import("StatusBar.zig");
 
 const log = std.log.scoped(.app);
 
-const SurfaceList = std.ArrayListUnmanaged(*apprt.Surface);
 const SessionList = std.ArrayListUnmanaged(*Session);
+const TabList = std.ArrayListUnmanaged(Tab);
+
+/// Thin wrapper around apprt.Surface for use as a SplitTree view.
+/// The SplitTree generic requires ref/unref/eql. This wrapper provides
+/// those without owning the surface lifecycle — ref creates a new wrapper
+/// allocation, unref frees it.
+pub const SurfaceView = struct {
+    surface: *apprt.Surface,
+
+    pub fn ref(self: *SurfaceView, alloc: Allocator) !*SurfaceView {
+        const ptr = try alloc.create(SurfaceView);
+        ptr.* = self.*;
+        return ptr;
+    }
+
+    pub fn unref(self: *SurfaceView, alloc: Allocator) void {
+        alloc.destroy(self);
+    }
+
+    pub fn eql(self: *const SurfaceView, other: *const SurfaceView) bool {
+        return self.surface == other.surface;
+    }
+};
+
+pub const SurfaceSplitTree = SplitTreeMod(SurfaceView);
+
+/// A tab groups one or more surfaces (split panes). The Zig core is the
+/// sole owner of tab identity — the Swift/GTK layer reads tab state from
+/// here so that close-tab always stays in sync with the status bar.
+pub const Tab = struct {
+    id: u32,
+    tree: SurfaceSplitTree,
+    tree_version: u64 = 0,
+    last_focused: ?*apprt.Surface = null,
+
+    pub fn deinit(self: *Tab, _: Allocator) void {
+        self.tree.deinit();
+    }
+
+    /// Iterator over all apprt surfaces in this tab's tree.
+    pub const SurfaceIterator = struct {
+        inner: SurfaceSplitTree.Iterator,
+
+        pub fn next(self: *SurfaceIterator) ?*apprt.Surface {
+            const entry = self.inner.next() orelse return null;
+            return entry.view.surface;
+        }
+    };
+
+    /// Returns an iterator over all surfaces in this tab.
+    pub fn surfaceIterator(self: *const Tab) SurfaceIterator {
+        return .{ .inner = self.tree.iterator() };
+    }
+
+    /// Find the tree handle for an apprt surface in this tab.
+    pub fn findHandle(self: *const Tab, rt_surface: *const apprt.Surface) ?SurfaceSplitTree.Node.Handle {
+        var iter = self.tree.iterator();
+        while (iter.next()) |entry| {
+            if (entry.view.surface == rt_surface) return entry.handle;
+        }
+        return null;
+    }
+
+    /// Find the tree handle for a core surface in this tab.
+    pub fn findHandleByCore(self: *const Tab, surface: *const Surface) ?SurfaceSplitTree.Node.Handle {
+        var iter = self.tree.iterator();
+        while (iter.next()) |entry| {
+            if (entry.view.surface.core() == surface) return entry.handle;
+        }
+        return null;
+    }
+
+    /// The first non-closing core surface in this tab, used as
+    /// the representative for display label and tab properties.
+    pub fn representativeSurface(self: *const Tab) ?*Surface {
+        var iter = self.tree.iterator();
+        while (iter.next()) |entry| {
+            const core = entry.view.surface.core();
+            if (!core.closing) return core;
+        }
+        return null;
+    }
+
+    /// Get the display label for this tab.
+    pub fn displayLabel(self: *const Tab) ?[]const u8 {
+        const rep = self.representativeSurface() orelse return null;
+        return rep.session.displayLabel();
+    }
+
+    /// Whether this tab has an explicit user-set name on its representative surface.
+    pub fn hasExplicitName(self: *const Tab) bool {
+        const rep = self.representativeSurface() orelse return false;
+        return rep.session.name != null;
+    }
+
+    /// Whether this tab contains the given core surface.
+    pub fn containsSurface(self: *const Tab, surface: *const Surface) bool {
+        var iter = self.tree.iterator();
+        while (iter.next()) |entry| {
+            if (entry.view.surface.core() == surface) return true;
+        }
+        return false;
+    }
+};
 
 /// General purpose allocator
 alloc: Allocator,
 
-/// The list of surfaces that are currently active.
-surfaces: SurfaceList,
+/// The list of tabs. Each tab owns one or more surfaces (splits).
+tabs: TabList,
+
+/// Counter for generating unique tab IDs.
+next_tab_id: u32 = 1,
 
 /// The list of sessions. Sessions persist independently of surfaces.
 /// A session remains in this list even when detached (no attached surface).
@@ -43,8 +151,20 @@ next_session_id: u32 = 0,
 /// before surface creation and consumed by Surface.init.
 reattach_on_next_surface: bool = false,
 
+/// The direction for the next split. Set by the apprt before surface
+/// creation (when handling new_split action) and consumed by addSurface.
+pending_split_direction: ?SurfaceSplitTree.Split.Direction = null,
+
 /// The control socket for external status bar updates and session queries.
 control_socket: ?ControlSocket = null,
+
+/// The status bar — one per App. Sources (tabs, daemon) send messages;
+/// the renderer reads segments. Replaces per-surface status_queue.
+status_bar: StatusBar,
+
+/// Last tab text sent to the status bar. Owned by the app thread —
+/// used for no-op dedup without reading the StatusBar's drained fields.
+last_tabs_text: []const u8 = "",
 
 /// This is true if the app that Ghostty is in is focused. This may
 /// mean that no surfaces (terminals) are focused but the app is still
@@ -115,11 +235,12 @@ pub fn init(
 
     self.* = .{
         .alloc = alloc,
-        .surfaces = .{},
+        .tabs = .{},
         .sessions = .{},
         .mailbox = .{},
         .font_grid_set = font_grid_set,
         .config_conditional_state = .{},
+        .status_bar = StatusBar.init(alloc),
     };
 }
 
@@ -149,9 +270,17 @@ pub fn deinit(self: *App) void {
         self.control_socket = null;
     }
 
-    // Clean up all our surfaces
-    for (self.surfaces.items) |surface| surface.deinit();
-    self.surfaces.deinit(self.alloc);
+    // Clean up the status bar
+    if (self.last_tabs_text.len > 0) self.alloc.free(self.last_tabs_text);
+    self.status_bar.deinit();
+
+    // Clean up all our tabs and surfaces
+    for (self.tabs.items) |*tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |surface| surface.deinit();
+        tab.deinit(self.alloc);
+    }
+    self.tabs.deinit(self.alloc);
 
     // Destroy any remaining sessions (detached or otherwise)
     for (self.sessions.items) |session| session.destroy();
@@ -186,8 +315,11 @@ pub fn tick(self: *App, rt_app: *apprt.App) !void {
 /// memory can be freed immediately when this returns.
 pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {
     // Go through and update all of the surface configurations.
-    for (self.surfaces.items) |surface| {
-        try surface.core().handleMessage(.{ .change_config = config });
+    for (self.tabs.items) |*tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |surface| {
+            try surface.core().handleMessage(.{ .change_config = config });
+        }
     }
 
     // Apply our conditional state. If we fail to apply the conditional state
@@ -213,12 +345,45 @@ pub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void
 
 /// Add an initialized surface. This is really only for the runtime
 /// implementations to call and should NOT be called by general app users.
-/// The surface must be from the pool.
+/// The context determines whether a new tab is created or the surface
+/// is added to the focused surface's existing tab.
 pub fn addSurface(
     self: *App,
     rt_surface: *apprt.Surface,
+    context: apprt.surface.NewSurfaceContext,
 ) Allocator.Error!void {
-    try self.surfaces.append(self.alloc, rt_surface);
+    switch (context) {
+        .split => {
+            // Insert into the focused surface's tab tree at the focused position.
+            if (self.focused_surface) |focused| {
+                if (self.tabForSurface(focused)) |tab| {
+                    const handle = self.findSurfaceHandleByCore(tab, focused) orelse .root;
+                    const dir = self.pending_split_direction orelse .right;
+                    self.pending_split_direction = null;
+
+                    var view: SurfaceView = .{ .surface = rt_surface };
+                    var insert = try SurfaceSplitTree.init(self.alloc, &view);
+                    defer insert.deinit();
+
+                    const new_tree = try tab.tree.split(self.alloc, handle, dir, 0.5, &insert);
+                    tab.tree.deinit();
+                    tab.tree = new_tree;
+                    tab.tree_version +%= 1;
+                } else {
+                    // Focused surface not in any tab, fall through to new tab.
+                    self.pending_split_direction = null;
+                    try self.createTab(rt_surface);
+                }
+            } else {
+                // No focused surface, create a new tab.
+                self.pending_split_direction = null;
+                try self.createTab(rt_surface);
+            }
+        },
+        .tab, .window => {
+            try self.createTab(rt_surface);
+        },
+    }
 
     // Since we have non-zero surfaces, we can cancel the quit timer.
     // It is up to the apprt if there is a quit timer at all and if it
@@ -232,8 +397,21 @@ pub fn addSurface(
     };
 }
 
+/// Create a new tab containing the given surface as a single-leaf tree.
+fn createTab(self: *App, rt_surface: *apprt.Surface) Allocator.Error!void {
+    var view: SurfaceView = .{ .surface = rt_surface };
+    var tree = try SurfaceSplitTree.init(self.alloc, &view);
+    errdefer tree.deinit();
+    try self.tabs.append(self.alloc, .{
+        .id = self.next_tab_id,
+        .tree = tree,
+    });
+    self.next_tab_id += 1;
+}
+
 /// Delete the surface from the known surface list. This will NOT call the
-/// destructor or free the memory.
+/// destructor or free the memory. If the surface's tab becomes empty,
+/// the tab is also removed, which keeps the status bar in sync.
 pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
     // If this surface is the focused surface then we need to clear it.
     // There was a bug where we relied on hasSurface to return false and
@@ -245,14 +423,33 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         }
     }
 
-    var i: usize = 0;
-    while (i < self.surfaces.items.len) {
-        if (self.surfaces.items[i] == rt_surface) {
-            _ = self.surfaces.swapRemove(i);
-            continue;
-        }
+    // Find and remove the surface from its tab's split tree.
+    var found = false;
+    var tab_i: usize = 0;
+    while (tab_i < self.tabs.items.len) {
+        var tab = &self.tabs.items[tab_i];
+        if (self.findSurfaceHandle(tab, rt_surface)) |handle| {
+            found = true;
+            const new_tree = tab.tree.remove(self.alloc, handle) catch {
+                tab_i += 1;
+                continue;
+            };
+            tab.tree.deinit();
+            tab.tree = new_tree;
+            tab.tree_version +%= 1;
 
-        i += 1;
+            // If the tree is now empty, remove the tab.
+            // orderedRemove preserves tab ordering (swapRemove scrambles it).
+            if (tab.tree.isEmpty()) {
+                tab.deinit(self.alloc);
+                _ = self.tabs.orderedRemove(tab_i);
+                continue;
+            }
+        }
+        tab_i += 1;
+    }
+    if (!found) {
+        log.debug("deleteSurface: surface not found in any tab (already removed)", .{});
     }
 
     // Clean up dead detached sessions (child exited, no surface attached)
@@ -269,12 +466,21 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
         }
     }
 
-    // Refresh status bars on remaining surfaces (tab count changed)
-    self.refreshAllStatusBars();
+    // Auto-focus a remaining surface if focused was cleared, so that
+    // the active tab marker (*) is correct immediately.
+    if (self.focused_surface == null and self.tabs.items.len > 0) {
+        var focus_iter = self.tabs.items[0].surfaceIterator();
+        if (focus_iter.next()) |surface| {
+            self.focused_surface = surface.core();
+        }
+    }
 
-    // If we have no surfaces AND no live sessions, we can start the
+    // Update status bar (tab count changed)
+    self.sendTabsUpdate();
+
+    // If we have no tabs AND no live sessions, we can start the
     // quit timer. It is up to the apprt to determine if this is necessary.
-    if (self.surfaces.items.len == 0 and self.sessions.items.len == 0) _ = rt_surface.rtApp().performAction(
+    if (self.tabs.items.len == 0 and self.sessions.items.len == 0) _ = rt_surface.rtApp().performAction(
         .app,
         .quit_timer,
         .start,
@@ -294,8 +500,11 @@ pub fn focusedSurface(self: *const App) ?*Surface {
 /// Returns true if confirmation is needed to quit the app. It is up to
 /// the apprt to call this.
 pub fn needsConfirmQuit(self: *const App) bool {
-    for (self.surfaces.items) |v| {
-        if (v.core().needsConfirmQuit()) return true;
+    for (self.tabs.items) |tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |surface| {
+            if (surface.core().needsConfirmQuit()) return true;
+        }
     }
 
     return false;
@@ -338,7 +547,10 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
 
 pub fn focusSurface(self: *App, surface: *Surface) void {
     if (!self.hasSurface(surface)) return;
+    const changed = self.focused_surface != surface;
     self.focused_surface = surface;
+    // Update status bar so the active tab marker (*) moves immediately.
+    if (changed) self.sendTabsUpdate();
 }
 
 fn redrawSurface(
@@ -559,13 +771,16 @@ pub fn performAllAction(
 
         // Surface-scoped actions are performed on all surfaces. Errors
         // are logged but processing continues.
-        .surface => for (self.surfaces.items) |surface| {
-            _ = surface.core().performBindingAction(action) catch |err| {
-                log.warn("error performing binding action on surface ptr={X} err={}", .{
-                    @intFromPtr(surface),
-                    err,
-                });
-            };
+        .surface => for (self.tabs.items) |tab| {
+            var iter = tab.surfaceIterator();
+            while (iter.next()) |surface| {
+                _ = surface.core().performBindingAction(action) catch |err| {
+                    log.warn("error performing binding action on surface ptr={X} err={}", .{
+                        @intFromPtr(surface),
+                        err,
+                    });
+                };
+            }
         },
     }
 }
@@ -584,19 +799,52 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
 }
 
 fn hasSurface(self: *const App, surface: *const Surface) bool {
-    for (self.surfaces.items) |v| {
-        if (v.core() == surface) return true;
+    for (self.tabs.items) |tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |s| {
+            if (s.core() == surface) return true;
+        }
     }
 
     return false;
 }
 
 fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
-    for (self.surfaces.items) |v| {
-        if (v == surface) return true;
+    for (self.tabs.items) |tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |s| {
+            if (s == surface) return true;
+        }
     }
 
     return false;
+}
+
+/// Find the tab that contains the given core surface.
+pub fn tabForSurface(self: *App, surface: *const Surface) ?*Tab {
+    for (self.tabs.items) |*tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |s| {
+            if (s.core() == surface) return tab;
+        }
+    }
+    return null;
+}
+
+/// Get the tab ID for a given core surface, or 0 if not found.
+pub fn tabIdForSurface(self: *App, surface: *const Surface) u32 {
+    if (self.tabForSurface(surface)) |tab| return tab.id;
+    return 0;
+}
+
+/// Find the split tree handle for an apprt surface within a tab.
+fn findSurfaceHandle(_: *const App, tab: *const Tab, rt_surface: *const apprt.Surface) ?SurfaceSplitTree.Node.Handle {
+    return tab.findHandle(rt_surface);
+}
+
+/// Find the split tree handle for a core surface within a tab.
+fn findSurfaceHandleByCore(_: *const App, tab: *const Tab, surface: *const Surface) ?SurfaceSplitTree.Node.Handle {
+    return tab.findHandleByCore(surface);
 }
 
 /// Create a new session and register it with the app.
@@ -666,16 +914,75 @@ pub fn logSessions(self: *App) void {
     }
 }
 
-/// Refresh the status bar on all surfaces. Call this when the tab list
-/// changes (surface created/destroyed/renamed) so all status bars update.
-pub fn refreshAllStatusBars(self: *App) void {
-    for (self.surfaces.items) |surface| {
-        if (surface.core_surface.closing) continue;
-        surface.core_surface.refreshStatusBar() catch |err| {
-            log.warn("refreshStatusBar failed err={}", .{err});
-        };
+/// Notify the App's StatusBar that tab state changed.
+/// Builds tab text and sends ONE message to the status bar.
+/// Then wakes all renderers so they pick up the new version.
+/// Skips the send+wake if the text hasn't changed.
+pub fn sendTabsUpdate(self: *App) void {
+    const text = self.buildTabsText() catch return;
+
+    // No-op guard: compare against app-thread-owned copy (no cross-thread read).
+    if (std.mem.eql(u8, text, self.last_tabs_text)) {
+        self.alloc.free(text);
+        return;
+    }
+
+    // Update our app-thread copy before sending.
+    if (self.last_tabs_text.len > 0) self.alloc.free(self.last_tabs_text);
+    self.last_tabs_text = self.alloc.dupe(u8, text) catch "";
+
+    // Send as set_text — the StatusBar owns the allocation after send.
+    self.status_bar.send(.{ .set_text = .{
+        .left = text,
+        .right = null,
+    } });
+
+    self.wakeRenderers();
+}
+
+/// Wake all renderer threads so they pick up status bar or other changes.
+pub fn wakeRenderers(self: *App) void {
+    for (self.tabs.items) |tab| {
+        var iter = tab.surfaceIterator();
+        while (iter.next()) |surface| {
+            if (surface.core_surface.closing) continue;
+            surface.core_surface.queueRender() catch {};
+        }
     }
 }
+
+/// Build the status bar tab list text. Caller owns the returned slice.
+fn buildTabsText(self: *App) ![]u8 {
+    var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer text_buf.deinit(self.alloc);
+    const w = text_buf.writer(self.alloc);
+
+    const focused = self.focused_surface;
+
+    var tab_idx: usize = 0;
+    for (self.tabs.items) |tab| {
+        const label_raw = tab.displayLabel() orelse continue;
+
+        // Tab is active if it contains the focused surface.
+        const is_active = if (focused) |f| tab.containsSurface(f) else false;
+
+        const label = if (tab.hasExplicitName())
+            label_raw
+        else
+            Surface.shortenLabel(label_raw);
+
+        if (tab_idx > 0) try w.writeByte(' ');
+        if (is_active) {
+            try w.print("{d}:{s}*", .{ tab_idx + 1, label });
+        } else {
+            try w.print("{d}:{s}", .{ tab_idx + 1, label });
+        }
+        tab_idx += 1;
+    }
+
+    return try text_buf.toOwnedSlice(self.alloc);
+}
+
 
 /// The message types that can be sent to the app thread.
 pub const Message = union(enum) {

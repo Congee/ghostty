@@ -210,6 +210,17 @@ extension Ghostty {
         var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
         }
+
+        /// Close and free the underlying Ghostty surface immediately.
+        /// This removes the surface from the core app's surface list and
+        /// triggers a status bar refresh. Call this when removing a surface
+        /// from the UI without going through the normal close flow.
+        @MainActor
+        func closeSurface() {
+            surfaceModel?.close()
+            surfaceModel = nil
+        }
+
         /// Current scrollbar state, cached here for persistence across rebuilds
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?
@@ -253,7 +264,7 @@ extension Ghostty {
         // We need to support being a first responder so that we can get input events
         override var acceptsFirstResponder: Bool { return true }
 
-        init(_ app: ghostty_app_t, baseConfig: SurfaceConfiguration? = nil, uuid: UUID? = nil) {
+        init(_ app: ghostty_app_t, baseConfig: SurfaceConfiguration? = nil, uuid: UUID? = nil, initialSize: NSSize? = nil) {
             self.markedText = NSMutableAttributedString()
             self.id = uuid ?? .init()
 
@@ -272,8 +283,10 @@ extension Ghostty {
 
             // Initialize with some default frame size. The important thing is that this
             // is non-zero so that our layer bounds are non-zero so that our renderer
-            // can do SOMETHING.
-            super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+            // can do SOMETHING. When creating a new tab, we pass the current surface's
+            // point size to avoid a resize flash.
+            let frameSize = initialSize ?? NSSize(width: 800, height: 600)
+            super.init(frame: NSRect(origin: .zero, size: frameSize))
 
             // Our cache of screen data
             cachedScreenContents = .init(duration: .milliseconds(500)) { [weak self] in

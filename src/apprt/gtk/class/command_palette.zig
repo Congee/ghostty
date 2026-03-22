@@ -234,11 +234,14 @@ pub const CommandPalette = extern struct {
 
         // Get all surfaces from the core app
         const core_app = app.core();
-        for (core_app.surfaces.items) |apprt_surface| {
-            const surface = apprt_surface.gobj();
-            const cmd = Command.newJump(config, surface);
-            errdefer cmd.unref();
-            try commands.append(alloc, cmd);
+        for (core_app.tabs.items) |tab| {
+            var iter = tab.surfaceIterator();
+            while (iter.next()) |apprt_surface| {
+                const surface = apprt_surface.gobj();
+                const cmd = Command.newJump(config, surface);
+                errdefer cmd.unref();
+                try commands.append(alloc, cmd);
+            }
         }
     }
 

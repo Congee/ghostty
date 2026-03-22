@@ -331,21 +331,20 @@ test "SessionInfo displayLabel priority" {
     try testing.expectEqualStrings("unnamed", empty.displayLabel());
 }
 
-test "StatusBar in renderer State" {
-    const renderer_state = @import("renderer.zig");
+test "StatusBar send and drain" {
+    const StatusBarMod = @import("StatusBar.zig");
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    // Test StatusBar clone and deinit
-    const sb = renderer_state.State.StatusBar{
+    var sb = StatusBarMod.init(alloc);
+    defer sb.deinit();
+
+    sb.send(.{ .set_text = .{
         .left = try alloc.dupe(u8, "session:main"),
         .right = try alloc.dupe(u8, "14:32"),
-    };
-    defer sb.deinit(alloc);
+    } });
+    sb.drain();
 
-    var clone = try sb.clone(alloc);
-    defer clone.deinit(alloc);
-
-    try testing.expectEqualStrings("session:main", clone.left);
-    try testing.expectEqualStrings("14:32", clone.right);
+    try testing.expectEqualStrings("session:main", sb.left_text);
+    try testing.expectEqualStrings("14:32", sb.right_text);
 }

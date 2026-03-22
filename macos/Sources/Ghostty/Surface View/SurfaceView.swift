@@ -662,6 +662,10 @@ extension Ghostty {
         /// Context for surface creation
         var context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_WINDOW
 
+        /// Initial pixel dimensions for the surface. Avoids resize flash on new tabs.
+        var initialWidth: UInt32 = ghostty_surface_config_new().initial_width
+        var initialHeight: UInt32 = ghostty_surface_config_new().initial_height
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -719,6 +723,10 @@ extension Ghostty {
 
             // Set context
             config.context = context
+
+            // Set initial size
+            config.initial_width = initialWidth
+            config.initial_height = initialHeight
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in

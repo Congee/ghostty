@@ -45,6 +45,12 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    /// Tab surfaces for status-bar-managed tabs (no native tabbing).
+    /// Each entry is a surface tree (supporting splits within a tab).
+    /// The active tab's tree is always `surfaceTree`.
+    private(set) var tabs: [SplitTree<Ghostty.SurfaceView>] = []
+    private(set) var activeTabIndex: Int = 0
+
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
@@ -140,6 +146,10 @@ class BaseTerminalController: NSWindowController,
         // Initialize our initial surface.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: base))
+
+        // Initialize in-window tabs with the initial surface tree
+        self.tabs = [self.surfaceTree]
+        self.activeTabIndex = 0
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
@@ -291,6 +301,120 @@ class BaseTerminalController: NSWindowController,
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
+        }
+
+        // Keep tabs array in sync when splits change within the active tab
+        if !tabs.isEmpty && activeTabIndex < tabs.count {
+            tabs[activeTabIndex] = to
+        }
+    }
+
+    // MARK: In-Window Tab Management
+
+    /// Add a new tab within the same window (for status-bar-managed tabs).
+    func addTab(baseConfig: Ghostty.SurfaceConfiguration? = nil) {
+        guard let ghostty_app = ghostty.app else { return }
+        var config = baseConfig ?? Ghostty.SurfaceConfiguration()
+        var initialSize: NSSize? = nil
+
+        // Pass current surface dimensions to avoid 800x600 → real size flash
+        if let currentSurface = surfaceTree.first, let surface = currentSurface.surface {
+            // Point size for NSView frame
+            initialSize = currentSurface.bounds.size
+            // Pixel size for Zig surface grid
+            let surfaceSize = ghostty_surface_size(surface)
+            config.initialWidth = surfaceSize.width_px
+            config.initialHeight = surfaceSize.height_px
+        }
+
+        let newSurface = Ghostty.SurfaceView(ghostty_app, baseConfig: config, initialSize: initialSize)
+        let newTree = SplitTree<Ghostty.SurfaceView>(view: newSurface)
+        tabs.append(newTree)
+        switchToTab(tabs.count - 1)
+    }
+
+    /// Switch to a specific in-window tab by index.
+    func switchToTab(_ index: Int) {
+        guard index >= 0, index < tabs.count else { return }
+        guard index != activeTabIndex else { return }
+
+        // Unfocus all surfaces in the current tab
+        for surfaceView in surfaceTree {
+            surfaceView.focusDidChange(false)
+        }
+
+        // Mark current tab surfaces as occluded (not rendering)
+        for view in surfaceTree {
+            if let surface = view.surface {
+                ghostty_surface_set_occlusion(surface, false)
+            }
+        }
+
+        // Save current tab's tree
+        tabs[activeTabIndex] = surfaceTree
+        activeTabIndex = index
+
+        // Load target tab's tree — triggers surfaceTreeDidChange → UI update
+        surfaceTree = tabs[activeTabIndex]
+
+        // Mark new tab surfaces as visible
+        let visible = self.window?.occlusionState.contains(.visible) ?? false
+        for view in surfaceTree {
+            if let surface = view.surface {
+                ghostty_surface_set_occlusion(surface, visible)
+            }
+        }
+
+        // Focus the first surface in the new tab
+        if let surface = surfaceTree.first {
+            DispatchQueue.main.async {
+                Ghostty.moveFocus(to: surface)
+            }
+        }
+    }
+
+    /// Close a specific in-window tab by index.
+    func closeInWindowTab(_ index: Int) {
+        guard index >= 0, index < tabs.count else { return }
+        let removedTree = tabs.remove(at: index)
+
+        if tabs.isEmpty {
+            // Close surfaces before closing window
+            for view in removedTree {
+                view.closeSurface()
+            }
+            window?.close()
+            return
+        }
+
+        // Switch to remaining tab FIRST — before closing removed surfaces.
+        // This ensures the remaining tab is visible and focused when
+        // deleteSurface → refreshAllStatusBars runs.
+        if activeTabIndex > index {
+            activeTabIndex -= 1
+        } else if activeTabIndex >= tabs.count {
+            activeTabIndex = tabs.count - 1
+        }
+
+        surfaceTree = tabs[activeTabIndex]
+
+        // Mark new tab surfaces as visible so the renderer draws
+        let visible = self.window?.occlusionState.contains(.visible) ?? false
+        for view in surfaceTree {
+            if let surface = view.surface {
+                ghostty_surface_set_occlusion(surface, visible)
+            }
+        }
+
+        // Focus the first surface in the new active tab
+        if let surface = surfaceTree.first {
+            Ghostty.moveFocus(to: surface)
+        }
+
+        // NOW close removed surfaces — deleteSurface → refreshAllStatusBars
+        // runs while the remaining tab is visible and focused.
+        for view in removedTree {
+            view.closeSurface()
         }
     }
 

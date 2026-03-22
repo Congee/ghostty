@@ -9,8 +9,11 @@ extension Ghostty {
     /// all over.
     ///
     /// Wraps a `ghostty_surface_t`
-    final class Surface: Sendable {
+    final class Surface: @unchecked Sendable {
         private let surface: ghostty_surface_t
+
+        /// True once `close()` has been called. Prevents double-free in deinit.
+        private var closed = false
 
         /// Read the underlying C value for this surface. This is unsafe because the value will be
         /// freed when the Surface class is deinitialized.
@@ -24,6 +27,9 @@ extension Ghostty {
         }
 
         deinit {
+            // If close() was already called, the surface is already freed.
+            guard !closed else { return }
+
             // deinit is not guaranteed to happen on the main actor and our API
             // calls into libghostty must happen there so we capture the surface
             // value so we don't capture `self` and then we detach it in a task.
@@ -33,6 +39,17 @@ extension Ghostty {
             Task.detached { @MainActor in
                 ghostty_surface_free(surface)
             }
+        }
+
+        /// Immediately free the underlying Zig surface. This removes the surface
+        /// from the core app's surface list, triggers status bar refresh, and
+        /// cleans up all core resources. After calling this, the surface pointer
+        /// is invalid. The deinit will skip the free to avoid double-free.
+        @MainActor
+        func close() {
+            guard !closed else { return }
+            closed = true
+            ghostty_surface_free(surface)
         }
 
         /// Send text to the terminal as if it was typed. This doesn't send the key events so keyboard

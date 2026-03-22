@@ -6,6 +6,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const AppStatusBar = @import("../StatusBar.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -30,10 +31,9 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
-/// Status bar state. When set, a status bar is rendered at the bottom
-/// of the terminal using one row of reserved padding. Updated via
-/// Surface.setStatusBar() or the control socket.
-status_bar: ?StatusBar = null,
+/// Pointer to the App-level StatusBar. Set during Surface init.
+/// The renderer reads from this to build status bar segments.
+app_status_bar: ?*AppStatusBar = null,
 
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use
@@ -205,52 +205,4 @@ pub const ClickRegion = struct {
     action: Component.ClickAction.Action,
 };
 
-/// Status bar content for rendering in the reserved bottom padding area.
-/// Layout: [left_components] [tabs (native)] [right_components]
-pub const StatusBar = struct {
-    /// Plain text fallback (for backward compat with SET-STATUS-LEFT/RIGHT).
-    left: []const u8 = "",
-    right: []const u8 = "",
-
-    /// Styled components from external programs (SET-COMPONENTS).
-    left_components: []const Component = &.{},
-    right_components: []const Component = &.{},
-
-    /// Source IDs for component ownership tracking.
-    left_source: []const u8 = "",
-    right_source: []const u8 = "",
-
-    /// Click regions computed during the last render pass.
-    click_regions: []const ClickRegion = &.{},
-
-    pub fn deinit(self: *const StatusBar, alloc: Allocator) void {
-        if (self.left.len > 0) alloc.free(self.left);
-        if (self.right.len > 0) alloc.free(self.right);
-        for (self.left_components) |*comp| comp.deinit(alloc);
-        if (self.left_components.len > 0) alloc.free(self.left_components);
-        for (self.right_components) |*comp| comp.deinit(alloc);
-        if (self.right_components.len > 0) alloc.free(self.right_components);
-        if (self.left_source.len > 0) alloc.free(self.left_source);
-        if (self.right_source.len > 0) alloc.free(self.right_source);
-        if (self.click_regions.len > 0) alloc.free(self.click_regions);
-    }
-
-    pub fn clone(self: *const StatusBar, alloc: Allocator) !StatusBar {
-        var left_comps = try alloc.alloc(Component, self.left_components.len);
-        for (self.left_components, 0..) |*comp, i| {
-            left_comps[i] = try comp.clone(alloc);
-        }
-        var right_comps = try alloc.alloc(Component, self.right_components.len);
-        for (self.right_components, 0..) |*comp, i| {
-            right_comps[i] = try comp.clone(alloc);
-        }
-        return .{
-            .left = if (self.left.len > 0) try alloc.dupe(u8, self.left) else "",
-            .right = if (self.right.len > 0) try alloc.dupe(u8, self.right) else "",
-            .left_components = left_comps,
-            .right_components = right_comps,
-            .left_source = if (self.left_source.len > 0) try alloc.dupe(u8, self.left_source) else "",
-            .right_source = if (self.right_source.len > 0) try alloc.dupe(u8, self.right_source) else "",
-        };
-    }
-};
+// Tests for Component moved to StatusBar.zig; old per-surface StatusMessage/StatusBar removed.

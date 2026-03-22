@@ -51,17 +51,13 @@ br close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Full build (requires Xcode on macOS — builds xcframework + Swift app):
-zig build
+# Full build (Zig lib + macOS app via xcodebuild):
+# env -u CC -u LD needed in Nix shell to use Xcode's toolchain
+env -u CC -u LD xcodebuild -project macos/Ghostty.xcodeproj -scheme Ghostty -configuration Debug ONLY_ACTIVE_ARCH=YES COMPILER_INDEX_STORE_ENABLE=NO build
 
-# Build without Xcode (Zig library only, no macOS app):
-zig build -Demit-xcframework=false -Demit-macos-app=false
-
-# Build libghostty-vt only (minimal, needs only CLI tools):
-zig build lib-vt -Demit-xcframework=false -Demit-macos-app=false
+# Output: macos/build/Debug/Ghostty.app (codesigned automatically)
+# Launch: open macos/build/Debug/Ghostty.app
 
 # Run tests:
 zig build test

@@ -287,25 +287,6 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
         window.toolbar = savedState.toolbar
         window.toolbarStyle = savedState.toolbarStyle
 
-        // If the window was previously in a tab group that isn't empty now,
-        // we re-add it. We have to do this because our process of doing non-native
-        // fullscreen removes the window from the tab group.
-        if let tabGroup = savedState.tabGroup,
-           let tabIndex = savedState.tabGroupIndex,
-            !tabGroup.windows.isEmpty {
-            if tabIndex == 0 {
-                // We were previously the first tab. Add it before ("below")
-                // the first window in the tab group currently.
-                tabGroup.windows.first!.addTabbedWindowSafely(window, ordered: .below)
-            } else if tabIndex <= tabGroup.windows.count {
-                // We were somewhere in the middle
-                tabGroup.windows[tabIndex - 1].addTabbedWindowSafely(window, ordered: .above)
-            } else {
-                // We were at the end
-                tabGroup.windows.last!.addTabbedWindowSafely(window, ordered: .below)
-            }
-        }
-
         if let firstResponder {
             window.makeFirstResponder(firstResponder)
         }

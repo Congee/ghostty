@@ -623,6 +623,7 @@ pub fn init(
         .renderer_state = .{
             .mutex = mutex,
             .terminal = &session.io.terminal,
+            .app_status_bar = &app.status_bar,
         },
         .renderer_thr = undefined,
         .mouse = .{},
@@ -678,6 +679,12 @@ pub fn init(
 
         // Start our IO implementation
         // This separate block ({}) is important because our errdefers must
+        // Start the control socket before building the shell env so
+        // GHOSTTY_SOCKET is available to child processes.
+        if (config.@"status-bar") {
+            app.ensureControlSocket(config.@"control-socket");
+        }
+
         // be scoped here to be valid.
         {
             var env = rt_surface.defaultTermioEnv() catch |err| env: {
@@ -757,11 +764,6 @@ pub fn init(
         self.session.io_thr.setName("io") catch {};
     }
 
-    // Start the control socket if status bar is enabled.
-    if (config.@"status-bar") {
-        app.ensureControlSocket(config.@"control-socket");
-    }
-
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
     // so we need to know our cell sizes first.
@@ -831,9 +833,8 @@ pub fn init(
     // We are no longer the first surface
     app.first = false;
 
-    // Refresh status bars on ALL surfaces (this surface is now fully
-    // initialized so it's safe to call displayLabel on its session).
-    app.refreshAllStatusBars();
+    // Update the App's StatusBar (this surface is now in a tab).
+    app.sendTabsUpdate();
 }
 
 pub fn deinit(self: *Surface) void {
@@ -900,13 +901,12 @@ pub fn deinit(self: *Surface) void {
 pub fn close(self: *Surface) void {
     const needs_confirm = self.needsConfirmQuit();
     if (!needs_confirm) {
-        // No confirmation needed — mark as closing immediately so the
-        // status bar updates right away, before the async teardown.
         self.closing = true;
-        self.app.refreshAllStatusBars();
+        // Update status bar immediately so the closing tab disappears.
+        self.app.sendTabsUpdate();
     }
-    // If confirmation is needed, we don't set closing yet because the
-    // user might cancel. The flag will be set when deleteSurface runs.
+    // Tell the apprt to clean up UI. If confirmation needed, Swift shows dialog.
+    // If not, Swift tears down the view → ghostty_surface_free → deleteSurface.
     self.rt_surface.close(needs_confirm);
 }
 
@@ -1041,8 +1041,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             log.debug("changing title \"{s}\"", .{slice});
 
             // Persist title on the session so it survives surface destruction.
+            // Only refresh status bars if the title actually changed.
+            const old_title = self.session.title;
             self.session.setTitle(slice) catch |err|
                 log.warn("failed to persist title on session err={}", .{err});
+
+            const changed = if (old_title) |ot|
+                !std.mem.eql(u8, ot, slice)
+            else
+                true;
+            if (changed) self.app.sendTabsUpdate();
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
@@ -2503,7 +2511,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// This queues a render operation with the renderer thread. The render
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
-fn queueRender(self: *Surface) !void {
+pub fn queueRender(self: *Surface) !void {
     try self.renderer_thread.wakeup.notify();
 }
 
@@ -2567,140 +2575,34 @@ fn balancePaddingIfNeeded(self: *Surface) void {
 ///
 /// The preedit input must be UTF-8 encoded.
 ///
-/// Update the status bar content. This is the main entry point for
-/// external tools (via the control socket) to update the status bar.
-/// Pass null to clear the status bar.
+/// Set the status bar text via the App's StatusBar.
 pub fn setStatusBar(self: *Surface, left: ?[]const u8, right: ?[]const u8) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-
-    // Free old status bar
-    if (self.renderer_state.status_bar) |sb| {
-        sb.deinit(self.alloc);
-        self.renderer_state.status_bar = null;
-    }
-
-    // Set new content if any
-    if (left != null or right != null) {
-        self.renderer_state.status_bar = .{
-            .left = if (left) |l| try self.alloc.dupe(u8, l) else "",
-            .right = if (right) |r| try self.alloc.dupe(u8, r) else "",
-        };
-    }
-
-    try self.queueRender();
-}
-
-/// Set styled components for a status bar zone (left or right).
-/// Components are rendered with per-segment colors and click regions.
-pub fn setComponents(
-    self: *Surface,
-    zone: []const u8,
-    source: []const u8,
-    components: []const rendererpkg.State.Component,
-) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-
-    // Ensure status bar exists
-    if (self.renderer_state.status_bar == null) {
-        self.renderer_state.status_bar = .{};
-    }
-    var sb = &self.renderer_state.status_bar.?;
-
-    const is_left = std.mem.eql(u8, zone, "left");
-
-    // Free old components for this zone
-    const old_comps = if (is_left) sb.left_components else sb.right_components;
-    for (old_comps) |*c| c.deinit(self.alloc);
-    if (old_comps.len > 0) self.alloc.free(old_comps);
-
-    const old_source = if (is_left) sb.left_source else sb.right_source;
-    if (old_source.len > 0) self.alloc.free(old_source);
-
-    // Clone and store new components
-    var new_comps = try self.alloc.alloc(rendererpkg.State.Component, components.len);
-    for (components, 0..) |*comp, i| {
-        new_comps[i] = try comp.clone(self.alloc);
-    }
-    const new_source = try self.alloc.dupe(u8, source);
-
-    if (is_left) {
-        sb.left_components = new_comps;
-        sb.left_source = new_source;
+    if (left == null and right == null) {
+        self.app.status_bar.send(.{ .clear_text = {} });
     } else {
-        sb.right_components = new_comps;
-        sb.right_source = new_source;
+        self.app.status_bar.send(.{ .set_text = .{
+            .left = if (left) |l| try self.alloc.dupe(u8, l) else null,
+            .right = if (right) |r| try self.alloc.dupe(u8, r) else null,
+        } });
     }
-
     try self.queueRender();
 }
 
-/// Clear all components from a given source.
-pub fn clearComponents(self: *Surface, source: []const u8) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-
-    var sb = &(self.renderer_state.status_bar orelse return);
-
-    if (std.mem.eql(u8, sb.left_source, source)) {
-        for (sb.left_components) |*c| c.deinit(self.alloc);
-        if (sb.left_components.len > 0) self.alloc.free(sb.left_components);
-        sb.left_components = &.{};
-        self.alloc.free(sb.left_source);
-        sb.left_source = "";
-    }
-    if (std.mem.eql(u8, sb.right_source, source)) {
-        for (sb.right_components) |*c| c.deinit(self.alloc);
-        if (sb.right_components.len > 0) self.alloc.free(sb.right_components);
-        sb.right_components = &.{};
-        self.alloc.free(sb.right_source);
-        sb.right_source = "";
-    }
-
-    try self.queueRender();
+/// Shorten a tab label for status bar display.
+/// "~/dev/ghostty/src" → "src", "/usr/local/bin" → "bin",
+/// "~/dev" → "dev", "shell" → "shell" (no change for short names).
+pub fn shortenLabel(label: []const u8) []const u8 {
+    // If it's short enough, use as-is
+    if (label.len <= 16) return label;
+    // Find the last path separator and use the basename
+    const base = std.fs.path.basename(label);
+    if (base.len > 0) return base;
+    // Truncate long non-path names at a UTF-8 boundary
+    var end: usize = 16;
+    while (end > 0 and label[end] & 0xC0 == 0x80) end -= 1;
+    return label[0..end];
 }
 
-/// Refresh the status bar by writing styled content directly into the
-/// terminal's last row via VT escape sequences. The terminal renders
-/// these as normal cells — no custom renderer needed (tmux model).
-///
-/// Layout: [left_components] [tabs] [right_components]
-/// The shell's scrolling region excludes the last row (DECSTBM).
-pub fn refreshStatusBar(self: *Surface) !void {
-    if (!self.config.status_bar_enabled) return;
-
-    // Build tab list as plain text. The renderer draws this as an extra
-    // row of GPU cells in the bottom padding area — no VT escapes needed.
-    var text_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer text_buf.deinit(self.alloc);
-    const w = text_buf.writer(self.alloc);
-
-    // Use app.focused_surface (not self) to determine the active tab.
-    // This ensures all surfaces show the same status bar text, preventing
-    // garbled text during macOS tab switch animations where the old
-    // surface's last frame is briefly visible alongside the new surface.
-    const focused = self.app.focused_surface;
-    const surfaces = self.app.surfaces.items;
-    var tab_idx: usize = 0;
-    for (surfaces) |surf| {
-        const core_surface: *Surface = &surf.core_surface;
-        if (core_surface.closing) continue;
-        const label = core_surface.session.displayLabel();
-        const is_active = if (focused) |f| (core_surface == f) else false;
-        if (is_active) {
-            try w.print(" [{d}:{s}*]", .{ tab_idx, label });
-        } else {
-            try w.print(" [{d}:{s}]", .{ tab_idx, label });
-        }
-        tab_idx += 1;
-    }
-
-    const left = try text_buf.toOwnedSlice(self.alloc);
-    defer self.alloc.free(left);
-
-    try self.setStatusBar(left, "");
-}
 
 
 
@@ -3501,8 +3403,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
         // Notify our app if we gained focus.
         self.app.focusSurface(self);
 
-        // Refresh status bar to update active tab indicator
-        self.refreshStatusBar() catch {};
+        // Status bar active tab indicator is updated by focusSurface above.
     } else unfocused: {
         // If we lost focus and we have a keypress, then we want to send a key
         // release event for it. Depending on the apprt, this CAN result in
@@ -4103,29 +4004,30 @@ pub fn mouseButtonCallback(
 
             const click_col: usize = pt_vp.x;
 
-            // Check component click regions first
-            if (self.renderer_state.status_bar) |sb| {
-                for (sb.click_regions) |region| {
-                    if (click_col >= region.x_start and click_col < region.x_end) {
-                        switch (region.action) {
-                            .notify => {
-                                if (self.app.control_socket) |*sock| {
-                                    sock.dispatchClick(region.source_id, region.click_id);
-                                }
-                            },
-                            .key => |_| {
-                                // TODO: execute keybind action
-                            },
-                            .cmd => |_| {
-                                // TODO: spawn subprocess
-                            },
-                        }
-                        return true;
+            // Check component click regions from the App's StatusBar
+            const sb = &self.app.status_bar;
+            for (sb.click_regions) |region| {
+                if (click_col >= region.x_start and click_col < region.x_end) {
+                    switch (region.action) {
+                        .notify => {
+                            if (self.app.control_socket) |*sock| {
+                                sock.dispatchClick(region.source_id, region.click_id);
+                            }
+                        },
+                        .key => |_| {
+                            // TODO: execute keybind action
+                        },
+                        .cmd => |_| {
+                            // TODO: spawn subprocess
+                        },
                     }
+                    return true;
                 }
+            }
 
-                // Fall back to tab click detection
-                const tab_index = self.findTabAtColumn(sb.left, click_col);
+            // Fall back to tab click detection using the left_text
+            if (sb.left_text.len > 0) {
+                const tab_index = self.findTabAtColumn(sb.left_text, click_col);
                 if (tab_index) |idx| {
                     _ = self.rt_app.performAction(
                         .{ .surface = self },
@@ -5647,8 +5549,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             self.session.setName(v) catch |err|
                 log.warn("failed to persist tab name on session err={}", .{err});
 
-            // Refresh status bar on all surfaces to reflect the rename
-            self.refreshStatusBar() catch {};
+            // Update status bar to reflect the rename
+            self.app.sendTabsUpdate();
 
             return try self.rt_app.performAction(
                 .{ .surface = self },

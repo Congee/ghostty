@@ -94,14 +94,6 @@ class TerminalWindow: NSWindow {
             self.configureTabContextMenuIfNeeded(menu)
         }
 
-        // This is required so that window restoration properly creates our tabs
-        // again. I'm not sure why this is required. If you don't do this, then
-        // tabs restore as separate windows.
-        tabbingMode = .preferred
-        DispatchQueue.main.async {
-            self.tabbingMode = .automatic
-        }
-
         // All new windows are based on the app config at the time of creation.
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
         let config = appDelegate.ghostty.config
@@ -117,8 +109,22 @@ class TerminalWindow: NSWindow {
             self.title = title
         }
 
-        // If window decorations are disabled, remove our title
-        if !config.windowDecorations { styleMask.remove(.titled) }
+        // If window decorations are disabled, remove the titlebar but allow
+        // tabbing. Without .titled the native tab bar can't render, so
+        // .preferred is safe and avoids macOS's "Tabs are disabled" system
+        // alert. Cmd+T is routed through newWindowForTab → in-window tabs.
+        if !config.windowDecorations {
+            styleMask.remove(.titled)
+            tabbingMode = .preferred
+        } else {
+            // This is required so that window restoration properly creates our tabs
+            // again. I'm not sure why this is required. If you don't do this, then
+            // tabs restore as separate windows.
+            tabbingMode = .preferred
+            DispatchQueue.main.async {
+                self.tabbingMode = .automatic
+            }
+        }
 
         // NOTE: setInitialWindowPosition is NOT called here because subclass
         // awakeFromNib may add decorations (e.g. toolbar for tabs style) that
@@ -243,12 +249,6 @@ class TerminalWindow: NSWindow {
 
     override func mergeAllWindows(_ sender: Any?) {
         super.mergeAllWindows(sender)
-
-        // It takes an event loop cycle to merge all the windows so we set a
-        // short timer to relabel the tabs (issue #1902)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.terminalController?.relabelTabs()
-        }
     }
 
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
@@ -719,17 +719,7 @@ extension TerminalWindow {
             .flatMap { $0.target as? NSWindow }
             .flatMap { $0.windowController as? TerminalController }
 
-        // Close tabs to the right
-        let item = NSMenuItem(title: "Close Tabs to the Right", action: #selector(TerminalController.closeTabsOnTheRight(_:)), keyEquivalent: "")
-        item.identifier = Self.closeTabsOnRightMenuItemIdentifier
-        item.target = targetController
-        item.setImageIfDesired(systemSymbolName: "xmark")
-        if menu.insertItem(item, after: NSSelectorFromString("performCloseOtherTabs:")) == nil,
-           menu.insertItem(item, after: NSSelectorFromString("performClose:")) == nil {
-            menu.addItem(item)
-        }
-
-        // Other close items should have the xmark to match Safari on macOS 26
+        // Close items should have the xmark to match Safari on macOS 26
         for menuItem in menu.items {
             if menuItem.action == NSSelectorFromString("performClose:") ||
                 menuItem.action == NSSelectorFromString("performCloseOtherTabs:") {

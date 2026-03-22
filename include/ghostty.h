@@ -477,6 +477,8 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  uint32_t initial_width;
+  uint32_t initial_height;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1103,6 +1105,20 @@ GHOSTTY_API bool ghostty_app_has_detached_sessions(ghostty_app_t);
 /// to the most recent detached session instead of creating a new one.
 GHOSTTY_API void ghostty_app_reattach_on_next_surface(ghostty_app_t);
 
+// Tab and split tree API
+GHOSTTY_API uint32_t ghostty_app_tab_count(ghostty_app_t);
+GHOSTTY_API uint32_t ghostty_app_tab_id_at(ghostty_app_t, uint32_t index);
+GHOSTTY_API int32_t ghostty_app_active_tab_index(ghostty_app_t);
+GHOSTTY_API uint64_t ghostty_app_tab_tree_version(ghostty_app_t, uint32_t tab_idx);
+GHOSTTY_API bool ghostty_app_tab_node_is_leaf(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API ghostty_surface_t ghostty_app_tab_node_surface(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API uint16_t ghostty_app_tab_node_left(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API uint16_t ghostty_app_tab_node_right(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API bool ghostty_app_tab_node_is_horizontal(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API double ghostty_app_tab_node_ratio(ghostty_app_t, uint32_t tab_idx, uint16_t handle);
+GHOSTTY_API bool ghostty_app_tab_is_zoomed(ghostty_app_t, uint32_t tab_idx);
+GHOSTTY_API uint16_t ghostty_app_tab_node_count(ghostty_app_t, uint32_t tab_idx);
+
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
@@ -1114,6 +1130,7 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_su
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+GHOSTTY_API uint32_t ghostty_surface_tab_id(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);

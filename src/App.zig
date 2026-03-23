@@ -357,7 +357,7 @@ pub fn addSurface(
             // Insert into the focused surface's tab tree at the focused position.
             if (self.focused_surface) |focused| {
                 if (self.tabForSurface(focused)) |tab| {
-                    const handle = self.findSurfaceHandleByCore(tab, focused) orelse .root;
+                    const handle = tab.findHandleByCore(focused) orelse .root;
                     const dir = self.pending_split_direction orelse .right;
                     self.pending_split_direction = null;
 
@@ -428,7 +428,7 @@ pub fn deleteSurface(self: *App, rt_surface: *apprt.Surface) void {
     var tab_i: usize = 0;
     while (tab_i < self.tabs.items.len) {
         var tab = &self.tabs.items[tab_i];
-        if (self.findSurfaceHandle(tab, rt_surface)) |handle| {
+        if (tab.findHandle(rt_surface)) |handle| {
             found = true;
             const new_tree = tab.tree.remove(self.alloc, handle) catch {
                 tab_i += 1;
@@ -835,16 +835,6 @@ pub fn tabForSurface(self: *App, surface: *const Surface) ?*Tab {
 pub fn tabIdForSurface(self: *App, surface: *const Surface) u32 {
     if (self.tabForSurface(surface)) |tab| return tab.id;
     return 0;
-}
-
-/// Find the split tree handle for an apprt surface within a tab.
-fn findSurfaceHandle(_: *const App, tab: *const Tab, rt_surface: *const apprt.Surface) ?SurfaceSplitTree.Node.Handle {
-    return tab.findHandle(rt_surface);
-}
-
-/// Find the split tree handle for a core surface within a tab.
-fn findSurfaceHandleByCore(_: *const App, tab: *const Tab, surface: *const Surface) ?SurfaceSplitTree.Node.Handle {
-    return tab.findHandleByCore(surface);
 }
 
 /// Create a new session and register it with the app.

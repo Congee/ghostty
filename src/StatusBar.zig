@@ -126,17 +126,19 @@ pub fn send(self: *StatusBar, msg: Message) void {
 }
 
 /// Drain pending messages and apply them. Called by the renderer thread.
-/// No external lock needed — drain holds its own mutex briefly.
+/// Holds mu for the entire operation so readers (e.g. ControlSocket IO
+/// thread) see consistent state when they acquire mu.
 pub fn drain(self: *StatusBar) void {
-    // Swap the queue under lock
-    var pending: std.ArrayListUnmanaged(Message) = pending: {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.queue.items.len == 0) return;
-        const q = self.queue;
-        self.queue = .{};
-        break :pending q;
-    };
+    self.mu.lock();
+    defer self.mu.unlock();
+
+    if (self.queue.items.len == 0) return;
+
+    // Swap the queue so send() can enqueue new messages if it
+    // manages to acquire mu after we release (between frames).
+    var pending = self.queue;
+    self.queue = .{};
+
     defer {
         for (pending.items) |*msg| msg.deinit(self.alloc);
         pending.deinit(self.alloc);

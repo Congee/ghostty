@@ -299,11 +299,15 @@ fn writeJsonString(w: anytype, s: []const u8) !void {
 }
 
 /// GET-STATUS-BAR: returns the current status bar text from the App's StatusBar.
+/// Acquires StatusBar.mu to safely read fields that drain() writes on the renderer thread.
 fn getStatusBar(self: *ControlSocket, buf: []u8) []const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
 
     const sb = &self.app.status_bar;
+    sb.mu.lock();
+    defer sb.mu.unlock();
+
     if (sb.hasContent()) {
         if (sb.left_text.len > 0) {
             w.writeAll(sb.left_text) catch return "ERR buffer overflow\n";

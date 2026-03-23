@@ -3362,6 +3362,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn rebuildStatusBar(self: *Self, segments: []const StatusSegment) !void {
             // The status bar uses the last row of the grid (like tmux).
             // No extra row is allocated — we overwrite the last terminal row.
+            if (self.cells.size.rows == 0) return;
             const status_row = self.cells.size.rows - 1;
             const cols = self.cells.size.columns;
 

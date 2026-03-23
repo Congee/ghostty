@@ -240,7 +240,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
 
     // Create our terminal
     var term = try terminalpkg.Terminal.init(alloc, opts: {
-        const grid_size = opts.size.grid();
+        const grid_size = adjustedGridSize(opts.size.grid(), opts.renderer_state.app_status_bar != null);
         break :opts .{
             .cols = grid_size.columns,
             .rows = grid_size.rows,
@@ -527,6 +527,21 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     }
 }
 
+/// Compute grid size with status bar row reservation.
+/// When status_bar_active is true, reduces rows by 1 (minimum 1).
+fn adjustedGridSize(grid: renderer.GridSize, status_bar_active: bool) renderer.GridSize {
+    var result = grid;
+    if (status_bar_active and result.rows > 1) {
+        result.rows -= 1;
+    }
+    return result;
+}
+
+/// Grid size adjusted for status bar (tmux approach: reserve 1 row).
+fn adjustedGrid(self: *Termio) renderer.GridSize {
+    return adjustedGridSize(self.size.grid(), self.renderer_state.app_status_bar != null);
+}
+
 /// Resize the terminal.
 pub fn resize(
     self: *Termio,
@@ -534,7 +549,7 @@ pub fn resize(
     size: renderer.Size,
 ) !void {
     self.size = size;
-    const grid_size = size.grid();
+    const grid_size = self.adjustedGrid();
 
     // Update the size of our pty.
     try self.backend.resize(grid_size, size.terminal());
@@ -578,7 +593,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
-    const grid_size = self.size.grid();
+    const grid_size = self.adjustedGrid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
         .columns = grid_size.columns,
@@ -816,6 +831,30 @@ pub const ThreadData = struct {
         self.* = undefined;
     }
 };
+
+test "adjustedGridSize reduces rows by 1 when status bar active" {
+    const grid = adjustedGridSize(.{ .columns = 80, .rows = 24 }, true);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 23), grid.rows);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 80), grid.columns);
+}
+
+test "adjustedGridSize no change when status bar inactive" {
+    const grid = adjustedGridSize(.{ .columns = 80, .rows = 24 }, false);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 24), grid.rows);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 80), grid.columns);
+}
+
+test "adjustedGridSize clamps to 1 row minimum" {
+    const grid = adjustedGridSize(.{ .columns = 80, .rows = 1 }, true);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 1), grid.rows);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 80), grid.columns);
+}
+
+test "adjustedGridSize large grid" {
+    const grid = adjustedGridSize(.{ .columns = 200, .rows = 100 }, true);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 99), grid.rows);
+    try std.testing.expectEqual(@as(renderer.GridSize.Unit, 200), grid.columns);
+}
 
 /// Get information about the process(es) attached to the backend. Returns
 /// `null` if there was an error getting the information or the information is

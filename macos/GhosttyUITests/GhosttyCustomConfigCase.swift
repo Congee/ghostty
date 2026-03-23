@@ -14,9 +14,12 @@ class GhosttyCustomConfigCase: XCTestCase {
     /// So that we don't have to wait for each ci check
     /// to run these tedious tests
     override class var defaultTestSuite: XCTestSuite {
-        // https://lldb.llvm.org/cpp_reference/PlatformDarwin_8cpp_source.html#:~:text==%20%22-,IDE_DISABLED_OS_ACTIVITY_DT_MODE
+        // Run when launched from Xcode IDE (sets IDE_DISABLED_OS_ACTIVITY_DT_MODE)
+        // or when the sentinel file exists (for CLI: touch /tmp/ghostty-run-uitests)
+        let ideMode = ProcessInfo.processInfo.environment["IDE_DISABLED_OS_ACTIVITY_DT_MODE"] != nil
+        let sentinel = FileManager.default.fileExists(atPath: "/tmp/ghostty-run-uitests")
 
-        if ProcessInfo.processInfo.environment["IDE_DISABLED_OS_ACTIVITY_DT_MODE"] != nil {
+        if ideMode || sentinel {
             return XCTestSuite(forTestCaseClass: Self.self)
         } else {
             return XCTestSuite(name: "Skipping \(className())")

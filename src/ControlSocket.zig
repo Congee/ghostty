@@ -9,6 +9,7 @@
 //!   LIST-SESSIONS             — List all sessions (JSON response)
 //!   LIST-TABS                 — List tabs with index, title, active flag (JSON)
 //!   GET-FOCUSED               — Get focused tab index and session info (JSON)
+//!   GET-DIMENSIONS            — Get terminal grid dimensions (JSON: rows, cols)
 //!   RENAME-TAB <name>         — Rename the focused tab
 //!   PING                      — Health check (responds PONG)
 //!
@@ -241,6 +242,10 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         return self.getStatusBar(resp_buf);
     }
 
+    if (std.mem.startsWith(u8, line, "GET-DIMENSIONS")) {
+        return self.getDimensions(resp_buf);
+    }
+
     if (std.mem.startsWith(u8, line, "GET-FOCUSED")) {
         return self.getFocused(resp_buf);
     }
@@ -389,6 +394,17 @@ fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     std.fmt.format(w, ",\"tabs\":{d}}}\n", .{
         tab_count,
     }) catch return "ERR buffer overflow\n";
+    return fbs.getWritten();
+}
+
+/// GET-DIMENSIONS: returns JSON with the terminal's actual grid dimensions.
+/// Reports the PTY rows/cols (after status bar deduction).
+fn getDimensions(self: *ControlSocket, buf: []u8) []const u8 {
+    const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+    const term = surface.renderer_state.terminal;
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    std.fmt.format(w, "{{\"rows\":{d},\"cols\":{d}}}\n", .{ term.rows, term.cols }) catch return "ERR fmt\n";
     return fbs.getWritten();
 }
 

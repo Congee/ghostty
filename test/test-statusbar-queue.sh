@@ -133,7 +133,7 @@ check_eq("CLEAR-STATUS accepted", "OK", cmd("CLEAR-STATUS"))
 time.sleep(0.3)
 resp = cmd("GET-STATUS-BAR")
 # After clear, should be (none) or tab text if renderer refreshed
-if "(none)" in resp or "[0:" in resp:
+if "(none)" in resp or "1:" in resp:
     ok("Status bar cleared or refreshed with tabs")
 else:
     fail("Unexpected after CLEAR-STATUS", resp)
@@ -167,13 +167,29 @@ time.sleep(0.3)
 resp = cmd("GET-STATUS-BAR")
 check_contains("Status bar shows renamed tab", "test-tab-name", resp)
 
-# --- Test 11: Unknown command ---
-print("\n--- Test 11: Error handling ---")
+# --- Test 11: GET-DIMENSIONS ---
+print("\n--- Test 11: GET-DIMENSIONS ---")
+resp = cmd("GET-DIMENSIONS")
+try:
+    dims = json.loads(resp)
+    if "rows" in dims and "cols" in dims:
+        ok(f"GET-DIMENSIONS returns valid JSON (rows={dims['rows']}, cols={dims['cols']})")
+        if dims["rows"] > 0 and dims["cols"] > 0:
+            ok("GET-DIMENSIONS rows and cols are positive")
+        else:
+            fail("GET-DIMENSIONS rows/cols not positive", resp)
+    else:
+        fail("GET-DIMENSIONS missing rows/cols", resp)
+except (json.JSONDecodeError, KeyError) as e:
+    fail("GET-DIMENSIONS invalid response", f"{resp} ({e})")
+
+# --- Test 12: Unknown command ---
+print("\n--- Test 12: Error handling ---")
 check_contains("Unknown command returns ERR", "ERR", cmd("FOOBAR"))
 check_contains("Invalid JSON returns ERR", "ERR", cmd("SET-COMPONENTS {bad json}"))
 
-# --- Test 12: Concurrent writers ---
-print("\n--- Test 12: Concurrent writers (3 sources × 20 iterations) ---")
+# --- Test 13: Concurrent writers ---
+print("\n--- Test 13: Concurrent writers (3 sources × 20 iterations) ---")
 errors = []
 
 def writer(source, n):

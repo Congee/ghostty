@@ -1392,6 +1392,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .blink_visible = cursor_blink_visible,
                     }),
                     &critical.links,
+                    critical.status_bar_segments.len > 0,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
                     // to update the cells. In this case, we continue with
@@ -2339,6 +2340,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
+            has_status_bar: bool,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
@@ -2350,9 +2352,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     std.log.warn("[rebuildCells time] {}\t{}", .{start_micro, end.since(start) / std.time.ns_per_us});
             // }
 
-            // The status bar uses the last terminal row (like tmux),
-            // so effective_rows matches state.rows — no extra allocation.
-            const effective_rows = state.rows;
+            // The PTY reports N-1 rows when status bar is active (tmux approach).
+            // Allocate one extra row so the cell buffer has N rows: N-1 terminal + 1 status bar.
+            const effective_rows = state.rows + @as(@TypeOf(state.rows), if (has_status_bar) 1 else 0);
 
             const grid_size_diff =
                 self.cells.size.rows != effective_rows or
@@ -2682,7 +2684,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y == self.cells.size.rows - 1) {
+                } else if (y == state.rows -| 1) {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -3360,8 +3362,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         fn rebuildStatusBar(self: *Self, segments: []const StatusSegment) !void {
-            // The status bar uses the last row of the grid (like tmux).
-            // No extra row is allocated — we overwrite the last terminal row.
+            // Status bar occupies the last row: terminal content fills rows 0..N-2,
+            // status bar fills row N-1 (like tmux's bottom status line).
             if (self.cells.size.rows == 0) return;
             const status_row = self.cells.size.rows - 1;
             const cols = self.cells.size.columns;

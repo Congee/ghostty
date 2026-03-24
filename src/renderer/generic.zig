@@ -3382,7 +3382,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const default_fg = self.config.foreground;
             var total_width: u16 = 0;
             for (segments) |seg| {
-                const wv = std.unicode.Utf8View.initUnchecked(seg.text);
+                const wv = std.unicode.Utf8View.init(seg.text) catch continue;
                 var wi = wv.iterator();
                 while (wi.nextCodepoint()) |cp| {
                     if (cp < 0x20) continue;
@@ -3397,7 +3397,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const font_style: font.Style = if (seg.bold) .bold else .regular;
                 const seg_bg: ?shaderpkg.CellBg = if (seg.bg) |bg| .{ bg[0], bg[1], bg[2], 255 } else null;
 
-                const view = std.unicode.Utf8View.initUnchecked(seg.text);
+                const view = std.unicode.Utf8View.init(seg.text) catch continue;
                 var it = view.iterator();
                 while (it.nextCodepoint()) |cp| {
                     if (x >= cols) break;

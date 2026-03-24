@@ -136,6 +136,11 @@ pub const Action = union(Key) {
     /// value is invalid.
     goto_tab: GotoTab,
 
+    /// Focus a specific surface, switching to its containing tab/split
+    /// if needed. Used by the embedded apprt to resolve goto_tab actions
+    /// into a concrete surface target.
+    focus_surface: FocusSurface,
+
     /// Jump to a specific split.
     goto_split: GotoSplit,
 
@@ -361,6 +366,7 @@ pub const Action = union(Key) {
         toggle_background_opacity,
         move_tab,
         goto_tab,
+        focus_surface,
         goto_split,
         goto_window,
         resize_split,
@@ -543,6 +549,10 @@ pub const ResizeSplit = extern struct {
             try lib.checkGhosttyHEnum(Direction, "GHOSTTY_RESIZE_SPLIT_");
         }
     };
+};
+
+pub const FocusSurface = extern struct {
+    surface: *apprt.Surface,
 };
 
 pub const MoveTab = extern struct {

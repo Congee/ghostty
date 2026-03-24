@@ -144,10 +144,9 @@ config_conditional_state: configpkg.ConditionalState,
 /// the status bar tab list immediately, before the async teardown completes.
 closing: bool = false,
 
-/// We maintain our focus state and assume we're focused by default.
-/// If we're not initially focused then apprts can call focusCallback
-/// to let us know.
-focused: bool = true,
+/// Focus state. Starts unfocused; the apprt calls focusCallback(true)
+/// when the surface actually receives focus (e.g. becomeFirstResponder).
+focused: bool = false,
 
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
@@ -3060,7 +3059,7 @@ fn maybeHandleBinding(
     const actions = leaf.actionsSlice();
 
     // Attempt to perform the action
-    log.debug("key event binding flags={} action={any}", .{
+    log.info("key event binding flags={} action={any}", .{
         leaf.flags,
         actions,
     });

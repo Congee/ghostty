@@ -109,21 +109,12 @@ class TerminalWindow: NSWindow {
             self.title = title
         }
 
-        // If window decorations are disabled, remove the titlebar but allow
-        // tabbing. Without .titled the native tab bar can't render, so
-        // .preferred is safe and avoids macOS's "Tabs are disabled" system
-        // alert. Cmd+T is routed through newWindowForTab → in-window tabs.
+        // Disable native tab handling — in-window tabs handle everything.
+        // This prevents AppKit from intercepting Cmd+1/2/3 for native tab switching.
+        tabbingMode = .disallowed
+
         if !config.windowDecorations {
             styleMask.remove(.titled)
-            tabbingMode = .preferred
-        } else {
-            // This is required so that window restoration properly creates our tabs
-            // again. I'm not sure why this is required. If you don't do this, then
-            // tabs restore as separate windows.
-            tabbingMode = .preferred
-            DispatchQueue.main.async {
-                self.tabbingMode = .automatic
-            }
         }
 
         // NOTE: setInitialWindowPosition is NOT called here because subclass
@@ -195,6 +186,24 @@ class TerminalWindow: NSWindow {
         }
 
         super.sendEvent(event)
+    }
+
+    /// Override to ensure key equivalents reach the terminal surface before
+    /// the menu system. With tabbingMode = .disallowed we don't use native
+    /// tabs, but the Window menu (systemMenu="window") still injects native
+    /// selectTab: items for Cmd+1-9. NSWindow.performKeyEquivalent normally
+    /// checks these AFTER views, but if no view claims the event the menu
+    /// items consume it as noop:. By forwarding directly to the first
+    /// responder at the window level, we bypass this entirely.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Forward to the first responder first (the terminal surface view).
+        // This ensures key events reach SurfaceView.performKeyEquivalent
+        // before NSWindow's default handling (which may route to menus).
+        if let responder = firstResponder, responder !== self,
+           responder.performKeyEquivalent(with: event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     override func close() {

@@ -218,7 +218,11 @@ pub fn hasContent(self: *const StatusBar) bool {
 
 /// Build segments for rendering. Caller must use arena allocator.
 /// Returns segments in order: left-zone components, tab text, right-zone components.
-pub fn buildSegments(self: *const StatusBar, arena: Allocator) []const Segment {
+/// Holds mu for the duration to prevent races with drain() on other renderer threads.
+pub fn buildSegments(self: *StatusBar, arena: Allocator) []const Segment {
+    self.mu.lock();
+    defer self.mu.unlock();
+
     var left_segs: std.ArrayListUnmanaged(Segment) = .empty;
     var right_segs: std.ArrayListUnmanaged(Segment) = .empty;
 

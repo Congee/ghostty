@@ -507,11 +507,14 @@ extension Ghostty {
                 toggleFullscreen(app, target: target, mode: action.action.toggle_fullscreen)
 
             case GHOSTTY_ACTION_MOVE_TAB:
-                Ghostty.logger.info("move_tab is not supported without native tabs")
                 return false
 
             case GHOSTTY_ACTION_GOTO_TAB:
-                return gotoTab(app, target: target, tab: action.action.goto_tab)
+                // Zig resolves goto_tab to focus_surface; this should not fire.
+                return false
+
+            case GHOSTTY_ACTION_FOCUS_SURFACE:
+                return doFocusSurface(app, target: target, surface: action.action.focus_surface.surface)
 
             case GHOSTTY_ACTION_GOTO_SPLIT:
                 return gotoSplit(app, target: target, direction: action.action.goto_split)
@@ -887,28 +890,15 @@ extension Ghostty {
         }
 
         private static func closeTab(_ app: ghostty_app_t, target: ghostty_target_s, mode: ghostty_action_close_tab_mode_e) {
-            switch target.tag {
-            case GHOSTTY_TARGET_APP:
-                Ghostty.logger.warning("close tabs does nothing with an app target")
-                return
+            guard target.tag == GHOSTTY_TARGET_SURFACE else { return }
+            guard let surface = target.target.surface else { return }
+            guard let surfaceView = self.surfaceView(from: surface) else { return }
 
-            case GHOSTTY_TARGET_SURFACE:
-                guard let surface = target.target.surface else { return }
-                guard let surfaceView = self.surfaceView(from: surface) else { return }
-
-                switch mode {
-                case GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS:
-                    NotificationCenter.default.post(
-                        name: .ghosttyCloseTab,
-                        object: surfaceView
-                    )
-
-                default:
-                    Ghostty.logger.info("unsupported close tab mode=\(mode.rawValue)")
-                }
-
-            default:
-                assertionFailure()
+            if mode == GHOSTTY_ACTION_CLOSE_TAB_MODE_THIS {
+                NotificationCenter.default.post(
+                    name: .ghosttyCloseTree,
+                    object: surfaceView
+                )
             }
         }
 
@@ -1066,34 +1056,17 @@ extension Ghostty {
             }
         }
 
-        private static func gotoTab(
+        private static func doFocusSurface(
             _ app: ghostty_app_t,
             target: ghostty_target_s,
-            tab: ghostty_action_goto_tab_e) -> Bool {
-                switch target.tag {
-                case GHOSTTY_TARGET_APP:
-                    Ghostty.logger.warning("goto tab does nothing with an app target")
-                    return false
+            surface: ghostty_surface_t?) -> Bool {
+                guard let surface = surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
-                case GHOSTTY_TARGET_SURFACE:
-                    guard let surface = target.target.surface else { return false }
-                    guard let surfaceView = self.surfaceView(from: surface) else { return false }
-
-                    // Check in-window tabs count
-                    guard let controller = surfaceView.window?.windowController as? BaseTerminalController,
-                          controller.tabs.count > 1 else { return false }
-
-                    NotificationCenter.default.post(
-                        name: Notification.ghosttyGotoTab,
-                        object: surfaceView,
-                        userInfo: [
-                            Notification.GotoTabKey: tab,
-                        ]
-                    )
-
-                default:
-                    assertionFailure()
-                }
+                NotificationCenter.default.post(
+                    name: Notification.ghosttyFocusSurface,
+                    object: surfaceView
+                )
 
                 return true
         }

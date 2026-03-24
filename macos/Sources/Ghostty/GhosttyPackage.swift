@@ -338,8 +338,8 @@ extension Notification.Name {
     static let ghosttyColorDidChange = Notification.Name("com.mitchellh.ghostty.ghosttyColorDidChange")
     static let GhosttyColorChangeKey = ghosttyColorDidChange.rawValue
 
-    /// Close tab
-    static let ghosttyCloseTab = Notification.Name("com.mitchellh.ghostty.closeTab")
+    /// Close the surface tree containing the target surface.
+    static let ghosttyCloseTree = Notification.Name("com.mitchellh.ghostty.closeTree")
 
     /// Close window
     static let ghosttyCloseWindow = Notification.Name("com.mitchellh.ghostty.closeWindow")
@@ -383,9 +383,8 @@ extension Ghostty.Notification {
     static let ghosttyFocusSplit = Notification.Name("com.mitchellh.ghostty.focusSplit")
     static let SplitDirectionKey = ghosttyFocusSplit.rawValue
 
-    /// Goto tab. Has tab index in the userinfo.
-    static let ghosttyGotoTab = Notification.Name("com.mitchellh.ghostty.gotoTab")
-    static let GotoTabKey = ghosttyGotoTab.rawValue
+    /// Focus a specific surface (switch to its tree if needed).
+    static let ghosttyFocusSurface = Notification.Name("com.mitchellh.ghostty.focusSurface")
 
     /// New tab. Has base surface config requested in userinfo.
     static let ghosttyNewTab = Notification.Name("com.mitchellh.ghostty.newTab")

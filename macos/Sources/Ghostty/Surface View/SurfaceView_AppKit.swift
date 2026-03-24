@@ -1277,23 +1277,7 @@ extension Ghostty {
             }
 
             // If this is a binding then we want to perform it.
-            if let bindingFlags {
-                // Attempt to trigger a menu item for this key binding. We only do this if:
-                //   - We're not in a key sequence or table (those are separate bindings)
-                //   - The binding is NOT `all` (menu uses FirstResponder chain)
-                //   - The binding is NOT `performable` (menu will always consume)
-                //   - The binding is `consumed` (unconsumed bindings should pass through
-                //     to the terminal, so we must not intercept them for the menu)
-                if keySequence.isEmpty,
-                   keyTables.isEmpty,
-                   bindingFlags.isDisjoint(with: [.all, .performable]),
-                   bindingFlags.contains(.consumed) {
-                    if let appDelegate = NSApp.delegate as? AppDelegate,
-                       appDelegate.performGhosttyBindingMenuKeyEquivalent(with: event) {
-                        return true
-                    }
-                }
-
+            if bindingFlags != nil {
                 self.keyDown(with: event)
                 return true
             }
@@ -2033,8 +2017,6 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         default:
             break
         }
-
-        print("SEL: \(selector)")
     }
 
     /// Sync the preedit state based on the markedText value to libghostty

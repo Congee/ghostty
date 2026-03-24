@@ -273,6 +273,19 @@ pub const App = struct {
         // embedded apprt.
         self.performPreAction(target, action, value);
 
+        // Resolve goto_tab into focus_surface so the Swift layer
+        // doesn't need to know about tab ordering.
+        if (action == .goto_tab) {
+            if (self.core_app.resolveGotoTab(value)) |surface| {
+                return self.opts.action(
+                    self,
+                    target.cval(),
+                    @unionInit(apprt.Action, "focus_surface", .{ .surface = surface }).cval(),
+                );
+            }
+            return false;
+        }
+
         log.debug("dispatching action target={t} action={} value={any}", .{
             target,
             action,

@@ -6926,14 +6926,7 @@ pub const Keybinds = struct {
                         .mods = mods,
                     },
                     .{ .goto_tab = (i - start) + 1 },
-                    .{
-                        // On macOS we keep this not performable so that the
-                        // keyboard shortcuts in tabs work. In the future the
-                        // correct fix is to fix the reverse mapping lookup
-                        // to allow us to lookup performable keybinds
-                        // conditionally.
-                        .performable = !builtin.target.os.tag.isDarwin(),
-                    },
+                    .{},
                 );
 
                 // Important: this must be the LAST binding set so that the

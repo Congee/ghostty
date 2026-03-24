@@ -62,13 +62,13 @@ class TerminalController: BaseTerminalController {
             object: nil)
         center.addObserver(
             self,
-            selector: #selector(onGotoTab),
-            name: Ghostty.Notification.ghosttyGotoTab,
+            selector: #selector(onFocusSurface),
+            name: Ghostty.Notification.ghosttyFocusSurface,
             object: nil)
         center.addObserver(
             self,
-            selector: #selector(onCloseTab),
-            name: .ghosttyCloseTab,
+            selector: #selector(onCloseTree),
+            name: .ghosttyCloseTree,
             object: nil)
         center.addObserver(
             self,
@@ -114,8 +114,8 @@ class TerminalController: BaseTerminalController {
             window.surfaceIsZoomed = to.zoomed != nil
         }
 
-        // If our surface tree is empty and no in-window tabs remain, close the window.
-        if to.isEmpty && tabs.count <= 1 {
+        // If our surface tree is empty and no other trees remain, close the window.
+        if to.isEmpty && allTrees.count <= 1 {
             self.window?.close()
         }
     }
@@ -126,12 +126,11 @@ class TerminalController: BaseTerminalController {
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
     ) {
-        // We have a special case if our tree is empty to close our tab immediately.
+        // We have a special case if our tree is empty to close it immediately.
         // This makes it so that undo is handled properly.
         if newTree.isEmpty {
-            // In-window tabs: close the active tab, switch to another
-            if tabs.count > 1 {
-                closeInWindowTab(activeTabIndex)
+            if allTrees.count > 1 {
+                closeTree(surfaceTree)
                 return
             }
             closeWindowImmediately()
@@ -357,8 +356,8 @@ class TerminalController: BaseTerminalController {
             return nil
         }
 
-        // All tabs are managed in-window.
-        parentController.addTab(baseConfig: baseConfig)
+        // Add a new surface tree to the parent controller.
+        parentController.addTree(baseConfig: baseConfig)
         return parentController
     }
 
@@ -449,13 +448,13 @@ class TerminalController: BaseTerminalController {
             return
         }
 
-        // In-window tabs: close current tab within the window
-        if tabs.count > 1 {
+        // Multiple trees: close current tree
+        if allTrees.count > 1 {
             closeTab(nil)
             return
         }
 
-        // Only one tab remaining, close the window
+        // Only one tree remaining, close the window
         closeWindow(nil)
     }
 
@@ -783,22 +782,22 @@ class TerminalController: BaseTerminalController {
     }
 
     @IBAction func closeTab(_ sender: Any?) {
-        // In-window tabs: close the active in-window tab
-        if tabs.count > 1 {
+        // Multiple trees: close the active one
+        if allTrees.count > 1 {
             guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
-                closeInWindowTab(activeTabIndex)
+                closeTree(surfaceTree)
                 return
             }
             confirmClose(
                 messageText: "Close Tab?",
                 informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
             ) {
-                self.closeInWindowTab(self.activeTabIndex)
+                self.closeTree(self.surfaceTree)
             }
             return
         }
 
-        // Only one tab — close the window
+        // Only one tree — close the window
         closeWindow(sender)
     }
 
@@ -865,41 +864,17 @@ class TerminalController: BaseTerminalController {
 
     // MARK: - Notifications
 
-    @objc private func onGotoTab(notification: SwiftUI.Notification) {
+    @objc private func onFocusSurface(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard target == self.focusedSurface else { return }
-
-        // Get the tab index from the notification
-        guard let tabEnumAny = notification.userInfo?[Ghostty.Notification.GotoTabKey] else { return }
-        guard let tabEnum = tabEnumAny as? ghostty_action_goto_tab_e else { return }
-        let tabIndex: Int32 = tabEnum.rawValue
-
-        // In-window tabs: handle tab switching locally.
-        guard tabs.count > 1 else { return }
-
-        let finalIndex: Int
-        if tabIndex <= 0 {
-            if tabIndex == GHOSTTY_GOTO_TAB_PREVIOUS.rawValue {
-                finalIndex = activeTabIndex == 0 ? tabs.count - 1 : activeTabIndex - 1
-            } else if tabIndex == GHOSTTY_GOTO_TAB_NEXT.rawValue {
-                finalIndex = activeTabIndex == tabs.count - 1 ? 0 : activeTabIndex + 1
-            } else if tabIndex == GHOSTTY_GOTO_TAB_LAST.rawValue {
-                finalIndex = tabs.count - 1
-            } else {
-                return
-            }
-        } else {
-            guard tabIndex >= 1 else { return }
-            finalIndex = min(Int(tabIndex - 1), tabs.count - 1)
-        }
-        guard finalIndex >= 0 else { return }
-        switchToTab(finalIndex)
+        // focusSurface checks allTrees internally; no need to pre-check here.
+        guard allTrees.contains(where: { $0.contains(target) }) else { return }
+        focusSurface(target)
     }
 
-    @objc private func onCloseTab(notification: SwiftUI.Notification) {
+    @objc private func onCloseTree(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard surfaceTree.contains(target) else { return }
-        closeTab(self)
+        guard let tree = allTrees.first(where: { $0.contains(target) }) else { return }
+        closeTree(tree)
     }
 
     @objc private func onCloseWindow(notification: SwiftUI.Notification) {

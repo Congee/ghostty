@@ -823,10 +823,7 @@ fn hasRtSurface(self: *const App, surface: *apprt.Surface) bool {
 /// Find the tab that contains the given core surface.
 pub fn tabForSurface(self: *App, surface: *const Surface) ?*Tab {
     for (self.tabs.items) |*tab| {
-        var iter = tab.surfaceIterator();
-        while (iter.next()) |s| {
-            if (s.core() == surface) return tab;
-        }
+        if (tab.containsSurface(surface)) return tab;
     }
     return null;
 }
@@ -835,6 +832,43 @@ pub fn tabForSurface(self: *App, surface: *const Surface) ?*Tab {
 pub fn tabIdForSurface(self: *App, surface: *const Surface) u32 {
     if (self.tabForSurface(surface)) |tab| return tab.id;
     return 0;
+}
+
+/// Find the index of the tab containing the given core surface.
+pub fn tabIndexForSurface(self: *App, surface: *const Surface) ?usize {
+    const tab = self.tabForSurface(surface) orelse return null;
+    const base = @intFromPtr(self.tabs.items.ptr);
+    return (@intFromPtr(tab) - base) / @sizeOf(Tab);
+}
+
+/// Resolve a goto_tab action to the representative apprt surface of the
+/// target tab. Returns null if the tab cannot be resolved (e.g., only
+/// one tab, or invalid index).
+pub fn resolveGotoTab(self: *App, goto: apprt.action.GotoTab) ?*apprt.Surface {
+    const tab_count = self.tabs.items.len;
+    if (tab_count <= 1) return null;
+
+    const focused = self.focusedSurface() orelse return null;
+    const current = self.tabIndexForSurface(focused) orelse return null;
+
+    const target_idx: usize = switch (goto) {
+        .previous => if (current == 0) tab_count - 1 else current - 1,
+        .next => if (current == tab_count - 1) 0 else current + 1,
+        .last => tab_count - 1,
+        _ => blk: {
+            const raw: c_int = @intFromEnum(goto);
+            if (raw < 1) return null;
+            const idx: usize = @intCast(raw - 1);
+            break :blk @min(idx, tab_count - 1);
+        },
+    };
+
+    if (target_idx == current) return null;
+
+    // Return the representative surface of the target tab.
+    const target_tab = &self.tabs.items[target_idx];
+    var iter = target_tab.surfaceIterator();
+    return iter.next();
 }
 
 /// Create a new session and register it with the app.

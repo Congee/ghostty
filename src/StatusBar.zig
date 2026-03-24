@@ -17,8 +17,8 @@ const log = std.log.scoped(.status_bar);
 
 alloc: Allocator,
 
-/// Components keyed by source. Each source owns its components independently.
-/// Key: source name (heap-allocated), Value: SourceData.
+/// Components keyed by "source:zone". A single source can have entries
+/// in multiple zones (e.g. "nvim:left" and "nvim:right").
 sources: std.StringArrayHashMapUnmanaged(SourceData) = .{},
 
 /// Thread-safe message queue.
@@ -30,6 +30,7 @@ version: u64 = 0,
 
 /// Plain text fallback for backward compat with SET-STATUS-LEFT/RIGHT.
 left_text: []const u8 = "",
+center_text: []const u8 = "",
 right_text: []const u8 = "",
 
 /// Click regions computed during the last render pass.
@@ -51,6 +52,7 @@ pub const Message = union(enum) {
     },
     set_text: struct {
         left: ?[]const u8,
+        center: ?[]const u8,
         right: ?[]const u8,
     },
     clear_text: void,
@@ -68,6 +70,7 @@ pub const Message = union(enum) {
             },
             .set_text => |st| {
                 if (st.left) |l| alloc.free(l);
+                if (st.center) |c| alloc.free(c);
                 if (st.right) |r| alloc.free(r);
             },
             .clear_text => {},
@@ -83,6 +86,19 @@ pub const Segment = struct {
     bold: bool = false,
 };
 
+/// Three-zone layout for the renderer.
+pub const SegmentLayout = struct {
+    left: []const Segment,
+    center: []const Segment,
+    right: []const Segment,
+
+    pub const empty: SegmentLayout = .{ .left = &.{}, .center = &.{}, .right = &.{} };
+
+    pub fn hasContent(self: SegmentLayout) bool {
+        return self.left.len > 0 or self.center.len > 0 or self.right.len > 0;
+    }
+};
+
 /// A region in the status bar that is clickable, computed during render.
 pub const ClickRegion = renderer.State.ClickRegion;
 
@@ -95,7 +111,7 @@ pub fn deinit(self: *StatusBar) void {
     for (self.queue.items) |*msg| msg.deinit(self.alloc);
     self.queue.deinit(self.alloc);
 
-    // Free source data
+    // Free source data (keys are "source:zone" composite strings)
     var it = self.sources.iterator();
     while (it.next()) |entry| {
         self.alloc.free(entry.key_ptr.*);
@@ -107,6 +123,7 @@ pub fn deinit(self: *StatusBar) void {
 
     // Free plain text
     if (self.left_text.len > 0) self.alloc.free(self.left_text);
+    if (self.center_text.len > 0) self.alloc.free(self.center_text);
     if (self.right_text.len > 0) self.alloc.free(self.right_text);
 
     // Free click regions
@@ -152,47 +169,70 @@ pub fn drain(self: *StatusBar) void {
 fn applyMessage(self: *StatusBar, msg: *Message) void {
     switch (msg.*) {
         .set_components => |*sc| {
-            // If source already exists, free old data
-            if (self.sources.getPtr(sc.source)) |existing| {
+            // Key is "source:zone" — use stack buffer for lookup, only
+            // heap-allocate when inserting a new entry.
+            var key_buf: [256]u8 = undefined;
+            const lookup_key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ sc.source, sc.zone }) catch return;
+
+            if (self.sources.getPtr(lookup_key)) |existing| {
                 self.alloc.free(existing.zone);
                 for (existing.items) |*c| c.deinit(self.alloc);
                 if (existing.items.len > 0) self.alloc.free(existing.items);
-                // Update in place — reuse the existing key
                 existing.zone = sc.zone;
                 existing.items = sc.items;
-                // Free the source key from the message since we reused the map key
                 self.alloc.free(sc.source);
             } else {
-                // New source
-                self.sources.put(self.alloc, sc.source, .{
+                const key = self.alloc.dupe(u8, lookup_key) catch return;
+                self.sources.put(self.alloc, key, .{
                     .zone = sc.zone,
                     .items = sc.items,
                 }) catch {
+                    self.alloc.free(key);
                     log.warn("failed to insert source into status bar", .{});
                     return;
                 };
+                self.alloc.free(sc.source);
             }
-            // Null out transferred fields so Message.deinit won't free them
             sc.source = "";
             sc.zone = "";
             sc.items = &.{};
             self.version +%= 1;
         },
         .clear_components => |cc| {
-            if (self.sources.fetchOrderedRemove(cc.source)) |kv| {
-                self.alloc.free(kv.key);
-                self.alloc.free(kv.value.zone);
-                for (kv.value.items) |*c| c.deinit(self.alloc);
-                if (kv.value.items.len > 0) self.alloc.free(kv.value.items);
+            // Remove ALL entries for this source (any zone).
+            // Keys are "source:zone" — match by source prefix before ":".
+            var i: usize = 0;
+            while (i < self.sources.count()) {
+                const key = self.sources.keys()[i];
+                const source_part = if (std.mem.indexOfScalar(u8, key, ':')) |sep|
+                    key[0..sep]
+                else
+                    key;
+
+                if (std.mem.eql(u8, source_part, cc.source)) {
+                    if (self.sources.fetchOrderedRemove(key)) |kv| {
+                        self.alloc.free(kv.key);
+                        self.alloc.free(kv.value.zone);
+                        for (kv.value.items) |*c| c.deinit(self.alloc);
+                        if (kv.value.items.len > 0) self.alloc.free(kv.value.items);
+                    }
+                } else {
+                    i += 1;
+                }
             }
             self.version +%= 1;
         },
         .set_text => |*st| {
-            if (st.left == null and st.right == null) return;
+            if (st.left == null and st.center == null and st.right == null) return;
             if (st.left) |l| {
                 if (self.left_text.len > 0) self.alloc.free(self.left_text);
                 self.left_text = l;
                 st.left = null; // transferred
+            }
+            if (st.center) |c| {
+                if (self.center_text.len > 0) self.alloc.free(self.center_text);
+                self.center_text = c;
+                st.center = null; // transferred
             }
             if (st.right) |r| {
                 if (self.right_text.len > 0) self.alloc.free(self.right_text);
@@ -204,6 +244,8 @@ fn applyMessage(self: *StatusBar, msg: *Message) void {
         .clear_text => {
             if (self.left_text.len > 0) self.alloc.free(self.left_text);
             self.left_text = "";
+            if (self.center_text.len > 0) self.alloc.free(self.center_text);
+            self.center_text = "";
             if (self.right_text.len > 0) self.alloc.free(self.right_text);
             self.right_text = "";
             self.version +%= 1;
@@ -213,24 +255,30 @@ fn applyMessage(self: *StatusBar, msg: *Message) void {
 
 /// Returns true if the status bar has any content to display.
 pub fn hasContent(self: *const StatusBar) bool {
-    return self.sources.count() > 0 or self.left_text.len > 0 or self.right_text.len > 0;
+    return self.sources.count() > 0 or self.left_text.len > 0 or self.center_text.len > 0 or self.right_text.len > 0;
 }
 
 /// Build segments for rendering. Caller must use arena allocator.
-/// Returns segments in order: left-zone components, tab text, right-zone components.
+/// Returns a three-zone layout (left, center, right) for vim-style positioning.
 /// Holds mu for the duration to prevent races with drain() on other renderer threads.
-pub fn buildSegments(self: *StatusBar, arena: Allocator) []const Segment {
+pub fn buildSegments(self: *StatusBar, arena: Allocator) SegmentLayout {
     self.mu.lock();
     defer self.mu.unlock();
 
     var left_segs: std.ArrayListUnmanaged(Segment) = .empty;
+    var center_segs: std.ArrayListUnmanaged(Segment) = .empty;
     var right_segs: std.ArrayListUnmanaged(Segment) = .empty;
 
-    // Single pass: partition source components by zone.
+    // Partition source components by zone.
     var it = self.sources.iterator();
     while (it.next()) |entry| {
-        const is_left = std.mem.eql(u8, entry.value_ptr.zone, "left");
-        const target = if (is_left) &left_segs else &right_segs;
+        const zone = entry.value_ptr.zone;
+        const target = if (std.mem.eql(u8, zone, "left"))
+            &left_segs
+        else if (std.mem.eql(u8, zone, "center"))
+            &center_segs
+        else
+            &right_segs;
         for (entry.value_ptr.items) |comp| {
             target.append(arena, .{
                 .text = arena.dupe(u8, comp.text) catch continue,
@@ -241,31 +289,36 @@ pub fn buildSegments(self: *StatusBar, arena: Allocator) []const Segment {
         }
     }
 
-    // Assemble: left components, tab text, separator, right components, right text.
-    var segs: std.ArrayListUnmanaged(Segment) = .empty;
-    segs.appendSlice(arena, left_segs.items) catch {};
-
+    // Append plain text to each zone.
     if (self.left_text.len > 0) {
-        if (segs.items.len > 0) {
-            segs.append(arena, .{ .text = " " }) catch {};
-        }
-        segs.append(arena, .{
+        if (left_segs.items.len > 0)
+            left_segs.append(arena, .{ .text = " " }) catch {};
+        left_segs.append(arena, .{
             .text = arena.dupe(u8, self.left_text) catch "",
         }) catch {};
     }
 
-    const has_right = right_segs.items.len > 0 or self.right_text.len > 0;
-    if (has_right) {
-        segs.append(arena, .{ .text = "  " }) catch {};
-        segs.appendSlice(arena, right_segs.items) catch {};
-        if (self.right_text.len > 0) {
-            segs.append(arena, .{
-                .text = arena.dupe(u8, self.right_text) catch "",
-            }) catch {};
-        }
+    if (self.center_text.len > 0) {
+        if (center_segs.items.len > 0)
+            center_segs.append(arena, .{ .text = " " }) catch {};
+        center_segs.append(arena, .{
+            .text = arena.dupe(u8, self.center_text) catch "",
+        }) catch {};
     }
 
-    return segs.items;
+    if (self.right_text.len > 0) {
+        if (right_segs.items.len > 0)
+            right_segs.append(arena, .{ .text = " " }) catch {};
+        right_segs.append(arena, .{
+            .text = arena.dupe(u8, self.right_text) catch "",
+        }) catch {};
+    }
+
+    return .{
+        .left = left_segs.items,
+        .center = center_segs.items,
+        .right = right_segs.items,
+    };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -294,7 +347,7 @@ test "send and drain set_components" {
     sb.drain();
     try testing.expect(sb.sources.count() == 1);
 
-    const data = sb.sources.get("daemon").?;
+    const data = sb.sources.get("daemon:left").?;
     try testing.expectEqualStrings("left", data.zone);
     try testing.expect(data.items.len == 1);
     try testing.expectEqualStrings("git:main", data.items[0].text);
@@ -328,18 +381,21 @@ test "set_text and clear_text" {
     defer sb.deinit();
 
     sb.send(.{ .set_text = .{
-        .left = try testing.allocator.dupe(u8, "1:~*"),
+        .left = try testing.allocator.dupe(u8, "left"),
+        .center = try testing.allocator.dupe(u8, "1:~*"),
         .right = null,
     } });
     sb.drain();
-    try testing.expectEqualStrings("1:~*", sb.left_text);
+    try testing.expectEqualStrings("left", sb.left_text);
+    try testing.expectEqualStrings("1:~*", sb.center_text);
 
     sb.send(.{ .set_text = .{
-        .left = try testing.allocator.dupe(u8, "1:~* 2:build"),
+        .left = null,
+        .center = try testing.allocator.dupe(u8, "1:~* 2:build"),
         .right = null,
     } });
     sb.drain();
-    try testing.expectEqualStrings("1:~* 2:build", sb.left_text);
+    try testing.expectEqualStrings("1:~* 2:build", sb.center_text);
 
     sb.send(.{ .clear_text = {} });
     sb.drain();
@@ -377,8 +433,8 @@ test "independent sources" {
     } });
     sb.drain();
     try testing.expect(sb.sources.count() == 1);
-    try testing.expect(sb.sources.get("tabs") != null);
-    try testing.expect(sb.sources.get("daemon") == null);
+    try testing.expect(sb.sources.get("tabs:left") != null);
+    try testing.expect(sb.sources.get("daemon:left") == null);
 }
 
 test "hasContent" {
@@ -389,6 +445,7 @@ test "hasContent" {
 
     sb.send(.{ .set_text = .{
         .left = try testing.allocator.dupe(u8, "tabs"),
+        .center = null,
         .right = null,
     } });
     sb.drain();
@@ -402,8 +459,161 @@ test "version bumps on changes" {
     const v0 = sb.version;
     sb.send(.{ .set_text = .{
         .left = try testing.allocator.dupe(u8, "x"),
+        .center = null,
         .right = null,
     } });
     sb.drain();
     try testing.expect(sb.version > v0);
+}
+
+test "same source different zones coexist" {
+    var sb = StatusBar.init(testing.allocator);
+    defer sb.deinit();
+
+    // Send left zone
+    var left_items = try testing.allocator.alloc(Component, 1);
+    left_items[0] = .{ .text = try testing.allocator.dupe(u8, "mode:N") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = left_items,
+    } });
+
+    // Send right zone from same source
+    var right_items = try testing.allocator.alloc(Component, 1);
+    right_items[0] = .{ .text = try testing.allocator.dupe(u8, "39:1") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "right"),
+        .items = right_items,
+    } });
+
+    sb.drain();
+
+    // Both entries should exist
+    try testing.expect(sb.sources.count() == 2);
+    try testing.expect(sb.sources.get("nvim:left") != null);
+    try testing.expect(sb.sources.get("nvim:right") != null);
+    try testing.expectEqualStrings("mode:N", sb.sources.get("nvim:left").?.items[0].text);
+    try testing.expectEqualStrings("39:1", sb.sources.get("nvim:right").?.items[0].text);
+}
+
+test "clear_components removes all zones for source" {
+    var sb = StatusBar.init(testing.allocator);
+    defer sb.deinit();
+
+    // Add left and right zones for same source
+    var left_items = try testing.allocator.alloc(Component, 1);
+    left_items[0] = .{ .text = try testing.allocator.dupe(u8, "left") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = left_items,
+    } });
+
+    var right_items = try testing.allocator.alloc(Component, 1);
+    right_items[0] = .{ .text = try testing.allocator.dupe(u8, "right") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "right"),
+        .items = right_items,
+    } });
+
+    // Add a different source that should survive
+    var other_items = try testing.allocator.alloc(Component, 1);
+    other_items[0] = .{ .text = try testing.allocator.dupe(u8, "other") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "daemon"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = other_items,
+    } });
+
+    sb.drain();
+    try testing.expect(sb.sources.count() == 3);
+
+    // Clear nvim — should remove both nvim:left and nvim:right
+    sb.send(.{ .clear_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+    } });
+    sb.drain();
+
+    try testing.expect(sb.sources.count() == 1);
+    try testing.expect(sb.sources.get("nvim:left") == null);
+    try testing.expect(sb.sources.get("nvim:right") == null);
+    try testing.expect(sb.sources.get("daemon:left") != null);
+}
+
+test "buildSegments three-zone layout" {
+    var sb = StatusBar.init(testing.allocator);
+    defer sb.deinit();
+
+    // Components in left and right zones
+    var left_items = try testing.allocator.alloc(Component, 1);
+    left_items[0] = .{ .text = try testing.allocator.dupe(u8, "N"), .style = .{ .bold = true } };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = left_items,
+    } });
+
+    var right_items = try testing.allocator.alloc(Component, 1);
+    right_items[0] = .{ .text = try testing.allocator.dupe(u8, "39:1") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "right"),
+        .items = right_items,
+    } });
+
+    // Center text from tabs
+    sb.send(.{ .set_text = .{
+        .left = null,
+        .center = try testing.allocator.dupe(u8, "1:vi* 2:zsh"),
+        .right = null,
+    } });
+
+    sb.drain();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const layout = sb.buildSegments(arena_state.allocator());
+
+    // Left zone: component
+    try testing.expect(layout.left.len == 1);
+    try testing.expectEqualStrings("N", layout.left[0].text);
+    try testing.expect(layout.left[0].bold);
+
+    // Center zone: text
+    try testing.expect(layout.center.len == 1);
+    try testing.expectEqualStrings("1:vi* 2:zsh", layout.center[0].text);
+
+    // Right zone: component
+    try testing.expect(layout.right.len == 1);
+    try testing.expectEqualStrings("39:1", layout.right[0].text);
+}
+
+test "update same source same zone replaces" {
+    var sb = StatusBar.init(testing.allocator);
+    defer sb.deinit();
+
+    var items1 = try testing.allocator.alloc(Component, 1);
+    items1[0] = .{ .text = try testing.allocator.dupe(u8, "old") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = items1,
+    } });
+    sb.drain();
+
+    var items2 = try testing.allocator.alloc(Component, 1);
+    items2[0] = .{ .text = try testing.allocator.dupe(u8, "new") };
+    sb.send(.{ .set_components = .{
+        .source = try testing.allocator.dupe(u8, "nvim"),
+        .zone = try testing.allocator.dupe(u8, "left"),
+        .items = items2,
+    } });
+    sb.drain();
+
+    // Should still be 1 entry, updated
+    try testing.expect(sb.sources.count() == 1);
+    try testing.expectEqualStrings("new", sb.sources.get("nvim:left").?.items[0].text);
 }

@@ -18,6 +18,7 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
+const StatusBar = @import("../StatusBar.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -1159,7 +1160,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
-                status_bar_segments: []const StatusSegment,
+                status_bar_layout: StatusBar.SegmentLayout,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1275,21 +1276,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Build styled segments from the App's StatusBar.
-                const sb_segments: []const StatusSegment = sb: {
-                    const sb = state.app_status_bar orelse break :sb &.{};
-                    if (!sb.hasContent()) break :sb &.{};
-                    const app_segs = sb.buildSegments(arena_alloc);
-                    // Convert StatusBar.Segment to our local StatusSegment
-                    var segs: std.ArrayListUnmanaged(StatusSegment) = .empty;
-                    for (app_segs) |seg| {
-                        segs.append(arena_alloc, .{
-                            .text = seg.text,
-                            .fg = seg.fg,
-                            .bg = seg.bg,
-                            .bold = seg.bold,
-                        }) catch {};
-                    }
-                    break :sb segs.items;
+                const sb_layout: StatusBar.SegmentLayout = sb: {
+                    const sb = state.app_status_bar orelse break :sb StatusBar.SegmentLayout.empty;
+                    if (!sb.hasContent()) break :sb StatusBar.SegmentLayout.empty;
+                    break :sb sb.buildSegments(arena_alloc);
                 };
 
                 break :critical .{
@@ -1298,7 +1288,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
-                    .status_bar_segments = sb_segments,
+                    .status_bar_layout = sb_layout,
                 };
             };
 
@@ -1392,7 +1382,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .blink_visible = cursor_blink_visible,
                     }),
                     &critical.links,
-                    critical.status_bar_segments.len > 0,
+                    critical.status_bar_layout.hasContent(),
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
                     // to update the cells. In this case, we continue with
@@ -1402,8 +1392,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Render status bar over the last terminal row (like tmux).
-                if (critical.status_bar_segments.len > 0) {
-                    self.rebuildStatusBar(critical.status_bar_segments) catch |err| {
+                if (critical.status_bar_layout.hasContent()) {
+                    self.rebuildStatusBar(critical.status_bar_layout) catch |err| {
                         log.warn("error rebuilding status bar err={}", .{err});
                     };
                 }
@@ -3353,15 +3343,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Render the status bar as an extra row of cells at y=rows,
         /// positioned in the bottom padding area. Reuses the font atlas
         /// and cell rendering pipeline — no shader changes needed.
-        /// A styled segment for the status bar.
-        const StatusSegment = struct {
-            text: []const u8,
-            fg: ?[3]u8 = null,
-            bg: ?[3]u8 = null,
-            bold: bool = false,
-        };
+        /// Compute total printable character width of a segment slice.
+        fn segmentWidth(segs: []const StatusBar.Segment) u16 {
+            var w: u16 = 0;
+            for (segs) |seg| {
+                const view = std.unicode.Utf8View.init(seg.text) catch continue;
+                var it = view.iterator();
+                while (it.nextCodepoint()) |cp| {
+                    if (cp >= 0x20) w +|= 1;
+                }
+            }
+            return w;
+        }
 
-        fn rebuildStatusBar(self: *Self, segments: []const StatusSegment) !void {
+        fn rebuildStatusBar(self: *Self, layout: StatusBar.SegmentLayout) !void {
             // Status bar occupies the last row: terminal content fills rows 0..N-2,
             // status bar fills row N-1 (like tmux's bottom status line).
             if (self.cells.size.rows == 0) return;
@@ -3378,21 +3373,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cells.bgCell(status_row, col).* = default_bg;
             }
 
-            // Compute total text width for centering
             const default_fg = self.config.foreground;
-            var total_width: u16 = 0;
-            for (segments) |seg| {
-                const wv = std.unicode.Utf8View.init(seg.text) catch continue;
-                var wi = wv.iterator();
-                while (wi.nextCodepoint()) |cp| {
-                    if (cp < 0x20) continue;
-                    total_width +|= 1;
-                }
-            }
-            var x: u16 = if (total_width < cols) (cols - total_width) / 2 else 0;
 
-            // Render each segment (bg + glyph in a single pass per segment).
-            for (segments) |seg| {
+            // Compute width of each zone.
+            const left_width = segmentWidth(layout.left);
+            const center_width = segmentWidth(layout.center);
+            const right_width = segmentWidth(layout.right);
+
+            // Position each zone: left at 0, right flush-right, center in the gap.
+            const left_x: u16 = 0;
+            const right_x: u16 = if (right_width < cols) cols - right_width else 0;
+
+            const center_x: u16 = blk: {
+                const gap_start = left_width;
+                const gap_end = right_x;
+                if (gap_end > gap_start and center_width <= gap_end - gap_start) {
+                    // Center in the gap between left and right zones.
+                    break :blk gap_start + (gap_end - gap_start - center_width) / 2;
+                } else if (center_width < cols) {
+                    // Fallback: center in full width.
+                    break :blk (cols - center_width) / 2;
+                } else {
+                    break :blk 0;
+                }
+            };
+
+            // Render each zone with bounds to prevent overlap.
+            try self.renderSegments(layout.left, left_x, center_x, status_row, default_fg);
+            try self.renderSegments(layout.center, center_x, right_x, status_row, default_fg);
+            try self.renderSegments(layout.right, right_x, cols, status_row, default_fg);
+        }
+
+        /// Render segments starting at x_start, stopping before x_limit.
+        fn renderSegments(
+            self: *Self,
+            segs: []const StatusBar.Segment,
+            x_start: u16,
+            x_limit: u16,
+            row: u16,
+            default_fg: terminal.color.RGB,
+        ) !void {
+            var x = x_start;
+            for (segs) |seg| {
                 const fg_r, const fg_g, const fg_b = if (seg.fg) |f| .{ f[0], f[1], f[2] } else .{ default_fg.r, default_fg.g, default_fg.b };
                 const font_style: font.Style = if (seg.bold) .bold else .regular;
                 const seg_bg: ?shaderpkg.CellBg = if (seg.bg) |bg| .{ bg[0], bg[1], bg[2], 255 } else null;
@@ -3400,23 +3422,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const view = std.unicode.Utf8View.init(seg.text) catch continue;
                 var it = view.iterator();
                 while (it.nextCodepoint()) |cp| {
-                    if (x >= cols) break;
+                    if (x >= x_limit) break;
                     if (cp < 0x20) continue;
 
-                    if (seg_bg) |bg| self.cells.bgCell(status_row, x).* = bg;
+                    if (seg_bg) |bg| self.cells.bgCell(row, x).* = bg;
 
-                    const render_ = self.font_grid.renderCodepoint(
-                        self.alloc,
-                        cp,
-                        font_style,
-                        .text,
-                        .{ .grid_metrics = self.grid_metrics },
-                    ) catch continue;
-                    const render = render_ orelse continue;
+                    // Try normal font rendering first, fall back to sprite font
+                    // for block-drawing characters (U+2580-U+259F etc.)
+                    const render = render: {
+                        if (self.font_grid.renderCodepoint(
+                            self.alloc,
+                            cp,
+                            font_style,
+                            null,
+                            .{ .grid_metrics = self.grid_metrics },
+                        ) catch null) |r| break :render r;
+                        // renderCodepoint fails for sprite-drawn chars (blocks, etc.)
+                        // Try the sprite font path directly.
+                        const idx = self.font_grid.getIndex(
+                            self.alloc, cp, font_style, null,
+                        ) catch continue orelse continue;
+                        break :render self.font_grid.renderGlyph(
+                            self.alloc, idx, cp, .{ .grid_metrics = self.grid_metrics },
+                        ) catch continue;
+                    };
 
                     try self.cells.add(self.alloc, .text, .{
                         .atlas = .grayscale,
-                        .grid_pos = .{ x, status_row },
+                        .grid_pos = .{ x, row },
                         .color = .{ fg_r, fg_g, fg_b, 255 },
                         .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                         .glyph_size = .{ render.glyph.width, render.glyph.height },

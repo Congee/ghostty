@@ -957,7 +957,8 @@ pub fn sendTabsUpdate(self: *App) void {
 
     // Send as set_text — the StatusBar owns the allocation after send.
     self.status_bar.send(.{ .set_text = .{
-        .left = text,
+        .left = null,
+        .center = text,
         .right = null,
     } });
 

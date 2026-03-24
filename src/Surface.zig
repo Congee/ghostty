@@ -2581,6 +2581,7 @@ pub fn setStatusBar(self: *Surface, left: ?[]const u8, right: ?[]const u8) !void
     } else {
         self.app.status_bar.send(.{ .set_text = .{
             .left = if (left) |l| try self.alloc.dupe(u8, l) else null,
+            .center = null,
             .right = if (right) |r| try self.alloc.dupe(u8, r) else null,
         } });
     }

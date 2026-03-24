@@ -158,46 +158,53 @@ fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
         return false;
     }
 
-    const line = std.mem.trimRight(u8, buf[0..n], "\r\n");
-    log.warn("handleConnection: received '{s}' fd={}", .{ line, conn });
+    const data = buf[0..n];
 
-    // SUBSCRIBE-CLICKS: keep connection open for push notifications
-    if (std.mem.startsWith(u8, line, "SUBSCRIBE-CLICKS ")) {
-        const source = line["SUBSCRIBE-CLICKS ".len..];
-        self.click_mutex.lock();
-        defer self.click_mutex.unlock();
+    // Split on newlines — multiple commands may arrive in one read().
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    while (line_iter.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
 
-        // If source already subscribed, close old fd before replacing
-        if (self.click_subscribers.getEntry(source)) |entry| {
-            posix.close(entry.value_ptr.*);
-            entry.value_ptr.* = conn;
-        } else {
-            const key = self.alloc.dupe(u8, source) catch {
-                _ = posix.write(conn, "ERR alloc failed\n") catch {};
-                return false;
-            };
-            self.click_subscribers.put(key, conn) catch {
-                self.alloc.free(key);
-                _ = posix.write(conn, "ERR alloc failed\n") catch {};
-                return false;
-            };
+        log.warn("handleConnection: received '{s}' fd={}", .{ line, conn });
+
+        // SUBSCRIBE-CLICKS: keep connection open for push notifications
+        if (std.mem.startsWith(u8, line, "SUBSCRIBE-CLICKS ")) {
+            const source = line["SUBSCRIBE-CLICKS ".len..];
+            self.click_mutex.lock();
+            defer self.click_mutex.unlock();
+
+            if (self.click_subscribers.getEntry(source)) |entry| {
+                posix.close(entry.value_ptr.*);
+                entry.value_ptr.* = conn;
+            } else {
+                const key = self.alloc.dupe(u8, source) catch {
+                    _ = posix.write(conn, "ERR alloc failed\n") catch {};
+                    return false;
+                };
+                self.click_subscribers.put(key, conn) catch {
+                    self.alloc.free(key);
+                    _ = posix.write(conn, "ERR alloc failed\n") catch {};
+                    return false;
+                };
+            }
+            _ = posix.write(conn, "OK subscribed\n") catch {};
+            log.info("click subscriber registered: {s} fd={}", .{ source, conn });
+            return true; // Keep connection open
         }
-        _ = posix.write(conn, "OK subscribed\n") catch {};
-        log.info("click subscriber registered: {s} fd={}", .{ source, conn });
-        return true; // Keep connection open
+
+        var resp_buf: [8192]u8 = undefined;
+        const response = self.handleCommand(line, &resp_buf) catch |err| {
+            const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return false;
+            _ = posix.write(conn, msg) catch {};
+            continue;
+        };
+
+        log.warn("handleConnection: responding with {d} bytes fd={}", .{ response.len, conn });
+        _ = posix.write(conn, response) catch |err| {
+            log.warn("handleConnection: write error fd={} err={}", .{ conn, err });
+        };
     }
-
-    var resp_buf: [8192]u8 = undefined;
-    const response = self.handleCommand(line, &resp_buf) catch |err| {
-        const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return false;
-        _ = posix.write(conn, msg) catch {};
-        return false;
-    };
-
-    log.warn("handleConnection: responding with {d} bytes fd={}", .{ response.len, conn });
-    _ = posix.write(conn, response) catch |err| {
-        log.warn("handleConnection: write error fd={} err={}", .{ conn, err });
-    };
     return false;
 }
 
@@ -253,7 +260,6 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
     if (std.mem.startsWith(u8, line, "SET-COMPONENTS ")) {
         const json = line["SET-COMPONENTS ".len..];
         const components = parseComponents(self.alloc, json) catch return "ERR invalid JSON\n";
-        // Send directly to the App's StatusBar — no per-surface queue.
         self.app.status_bar.send(.{ .set_components = .{
             .zone = components.zone,
             .source = components.source,
@@ -333,6 +339,7 @@ fn sendSetText(self: *ControlSocket, left: ?[]const u8, right: ?[]const u8) []co
     } else null;
     self.app.status_bar.send(.{ .set_text = .{
         .left = left_dup,
+        .center = null,
         .right = right_dup,
     } });
     self.wakeRenderers();

@@ -341,6 +341,7 @@ test "StatusBar send and drain" {
 
     sb.send(.{ .set_text = .{
         .left = try alloc.dupe(u8, "session:main"),
+        .center = null,
         .right = try alloc.dupe(u8, "14:32"),
     } });
     sb.drain();

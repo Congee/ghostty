@@ -336,6 +336,59 @@ pub const SplitTree = extern struct {
     /// Move focus from the currently focused surface to the given
     /// direction. Returns true if focus switched to a new surface.
     pub fn goto(self: *Self, to: Surface.Tree.Goto) bool {
+        // Try core tree first
+        if (self.getCoreTab()) |tab| {
+            const core_app = Application.default().core();
+            const focused = core_app.focused_surface orelse return false;
+            const active = tab.findHandleByCore(focused) orelse return false;
+
+            // Convert Goto union between tree types (structurally identical)
+            const core_to: CoreApp.SurfaceSplitTree.Goto = switch (to) {
+                .previous => .previous,
+                .next => .next,
+                .previous_wrapped => .previous_wrapped,
+                .next_wrapped => .next_wrapped,
+                .spatial => |d| .{ .spatial = @enumFromInt(@intFromEnum(d)) },
+            };
+            const target = if (tab.tree.goto(
+                core_app.alloc,
+                active,
+                core_to,
+            )) |handle_|
+                handle_ orelse return false
+            else |_| return false;
+
+            if (active == target) return false;
+
+            // Get GTK surface from core tree leaf and grab focus
+            const target_view = tab.tree.nodes[target.idx()].leaf;
+            const gtk_surface = target_view.surface.surface;
+            gtk_surface.grabFocus();
+
+            const old_last_focused = self.private().last_focused.get();
+            defer if (old_last_focused) |v| v.unref();
+            self.private().last_focused.set(gtk_surface);
+
+            // Handle zoom state changes via core
+            if (tab.tree.zoomed != null) {
+                const app = Application.default();
+                const config_obj = app.getConfig();
+                defer config_obj.unref();
+                const config = config_obj.get();
+
+                if (!config.@"split-preserve-zoom".navigation) {
+                    tab.tree.zoom(null);
+                } else {
+                    tab.tree.zoom(target);
+                }
+                tab.tree_version +%= 1;
+                self.triggerRebuild();
+            }
+
+            return true;
+        }
+
+        // Legacy fallback using GTK tree
         const tree = self.getTree() orelse return false;
         const active = self.getActiveSurfaceHandle() orelse return false;
         const target = if (tree.goto(
@@ -344,28 +397,16 @@ pub const SplitTree = extern struct {
             to,
         )) |handle_|
             handle_ orelse return false
-        else |err| switch (err) {
-            // Nothing we can do in this scenario. This is highly unlikely
-            // since split trees don't use that much memory. The application
-            // is probably about to crash in other ways.
-            error.OutOfMemory => return false,
-        };
+        else |_| return false;
 
-        // If we aren't changing targets then we did nothing.
         if (active == target) return false;
 
-        // Get the surface at the target location and grab focus.
         const surface = tree.nodes[target.idx()].leaf;
         surface.grabFocus();
 
-        // We also need to setup our last_focused to this because if we
-        // trigger a tree change like below, the grab focus above never
-        // actually triggers in time to set this and this ensures we
-        // grab focus to the right thing.
         const old_last_focused = self.private().last_focused.get();
-        defer if (old_last_focused) |v| v.unref(); // unref strong ref from get
+        defer if (old_last_focused) |v| v.unref();
         self.private().last_focused.set(surface);
-        errdefer self.private().last_focused.set(old_last_focused);
 
         if (tree.zoomed != null) {
             const app = Application.default();
@@ -379,9 +420,6 @@ pub const SplitTree = extern struct {
                 tree.zoom(target);
             }
 
-            // When the zoom state changes our tree state changes and
-            // we need to send the proper notifications to trigger
-            // relayout.
             const object = self.as(gobject.Object);
             object.notifyByPspec(properties.tree.impl.param_spec);
             object.notifyByPspec(properties.@"is-zoomed".impl.param_spec);
@@ -799,15 +837,15 @@ pub const SplitTree = extern struct {
         _: ?*CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
-        // Get the handle we're closing
         const priv = self.private();
         const handle = priv.pending_close orelse return;
         priv.pending_close = null;
 
-        // Figure out our next focus target. The next focus target is
-        // always the "previous" surface unless we're the leftmost then
-        // its the next.
+        // Get the surface being closed from the GTK tree.
         const old_tree = self.getTree() orelse return;
+        const closing_surface: *Surface = old_tree.nodes[handle.idx()].leaf;
+
+        // Figure out next focus target before removal.
         const next_focus: ?*Surface = next_focus: {
             const alloc = Application.default().allocator();
             const next_handle: Surface.Tree.Node.Handle =
@@ -815,27 +853,23 @@ pub const SplitTree = extern struct {
                 (old_tree.goto(alloc, handle, .next) catch null) orelse
                 break :next_focus null;
             if (next_handle == handle) break :next_focus null;
-
-            // Note: we don't need to ref this or anything because its
-            // guaranteed to remain in the new tree since its not part
-            // of the handle we're removing.
             break :next_focus old_tree.nodes[next_handle.idx()].leaf;
         };
 
-        // Remove it from the tree.
-        var new_tree = old_tree.remove(
-            Application.default().allocator(),
-            handle,
-        ) catch |err| {
-            log.warn("unable to remove surface from tree: {}", .{err});
-            return;
-        };
-        defer new_tree.deinit();
-        self.setTree(&new_tree);
+        // Close the surface. Core's deleteSurface removes it from the
+        // core tree and cleans up. The surface close triggers destruction.
+        if (closing_surface.core()) |core| {
+            core.close();
+        }
 
-        // Grab focus. We have to set this on the "last focused" because our
-        // focus will be set when the tree is redrawn.
-        if (next_focus) |v| priv.last_focused.set(v);
+        // Trigger widget rebuild from core tree.
+        self.triggerRebuild();
+
+        // Grab focus on the next surface.
+        if (next_focus) |v| {
+            priv.last_focused.set(v);
+            v.grabFocus();
+        }
     }
 
     fn propSurfaceFocused(

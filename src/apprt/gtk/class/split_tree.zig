@@ -7,6 +7,7 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const CoreApp = @import("../../../App.zig");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const ext = @import("../ext.zig");
@@ -806,6 +807,21 @@ pub const SplitTree = extern struct {
         );
     }
 
+    /// Find the core App.Tab for this split tree by looking up any surface
+    /// in the current GTK tree through the core App's tab list.
+    fn getCoreTab(self: *Self) ?*CoreApp.Tab {
+        const core_app = Application.default().core();
+        const surface = self.getActiveSurface() orelse {
+            // No active surface — try last_focused
+            const lf = self.private().last_focused.get() orelse return null;
+            defer lf.unref();
+            const core = lf.core() orelse return null;
+            return core_app.tabForSurface(core);
+        };
+        const core = surface.core() orelse return null;
+        return core_app.tabForSurface(core);
+    }
+
     fn onRebuild(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
 
@@ -813,17 +829,32 @@ pub const SplitTree = extern struct {
         const priv = self.private();
         priv.rebuild_source = null;
 
-        // Rebuild our tree
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
-        if (tree.isEmpty()) {
-            priv.tree_bin.setChild(null);
+        // Prefer core's tree as source of truth. Fall back to GTK-owned
+        // tree during the transition period (e.g. first surface init).
+        if (self.getCoreTab()) |tab| {
+            if (tab.tree.isEmpty()) {
+                priv.tree_bin.setChild(null);
+            } else {
+                const built = self.buildTree(
+                    &tab.tree,
+                    tab.tree.zoomed orelse .root,
+                );
+                defer built.deinit();
+                priv.tree_bin.setChild(built.widget);
+            }
         } else {
-            const built = self.buildTree(
-                tree,
-                tree.zoomed orelse .root,
-            );
-            defer built.deinit();
-            priv.tree_bin.setChild(built.widget);
+            // Fallback: use GTK-owned tree (during init before core has the surface)
+            const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+            if (tree.isEmpty()) {
+                priv.tree_bin.setChild(null);
+            } else {
+                const built = self.buildTreeLegacy(
+                    tree,
+                    tree.zoomed orelse .root,
+                );
+                defer built.deinit();
+                priv.tree_bin.setChild(built.widget);
+            }
         }
 
         // Replacing our tree widget hierarchy can reset focus state.
@@ -879,20 +910,23 @@ pub const SplitTree = extern struct {
 
     fn buildTree(
         self: *Self,
-        tree: *const Surface.Tree,
-        current: Surface.Tree.Node.Handle,
+        tree: *const CoreApp.SurfaceSplitTree,
+        current: CoreApp.SurfaceSplitTree.Node.Handle,
     ) BuildTreeResult {
         return switch (tree.nodes[current.idx()]) {
-            .leaf => |v| leaf: {
+            .leaf => |view| leaf: {
+                // Extract GTK surface from core's SurfaceView:
+                // SurfaceView.surface -> *apprt.Surface -> .surface -> *Surface (GTK GObject)
+                const gtk_surface = view.surface.surface;
                 const window = ext.getAncestor(
                     SurfaceScrolledWindow,
-                    v.as(gtk.Widget),
+                    gtk_surface.as(gtk.Widget),
                 ) orelse {
                     // The surface isn't in a window already so we don't
                     // have to worry about reuse.
                     break :leaf .initNew(gobject.ext.newInstance(
                         SurfaceScrolledWindow,
-                        .{ .surface = v },
+                        .{ .surface = gtk_surface },
                     ).as(gtk.Widget));
                 };
 
@@ -904,6 +938,47 @@ pub const SplitTree = extern struct {
                 const left = self.buildTree(tree, s.left);
                 defer left.deinit();
                 const right = self.buildTree(tree, s.right);
+                defer right.deinit();
+
+                // Cast from CoreApp.SurfaceSplitTree types to Surface.Tree types.
+                // These are structurally identical (same Layout, f16, Handle).
+                const handle: Surface.Tree.Node.Handle = @enumFromInt(@intFromEnum(current));
+                const gtk_split: *const Surface.Tree.Split = @ptrCast(&s);
+
+                break :split .initNew(SplitTreeSplit.new(
+                    handle,
+                    gtk_split,
+                    left.widget,
+                    right.widget,
+                ).as(gtk.Widget));
+            },
+        };
+    }
+
+    /// Legacy version of buildTree that takes a GTK Surface.Tree.
+    /// Used as fallback during init before core has the surface registered.
+    fn buildTreeLegacy(
+        self: *Self,
+        tree: *const Surface.Tree,
+        current: Surface.Tree.Node.Handle,
+    ) BuildTreeResult {
+        return switch (tree.nodes[current.idx()]) {
+            .leaf => |v| leaf: {
+                const window = ext.getAncestor(
+                    SurfaceScrolledWindow,
+                    v.as(gtk.Widget),
+                ) orelse {
+                    break :leaf .initNew(gobject.ext.newInstance(
+                        SurfaceScrolledWindow,
+                        .{ .surface = v },
+                    ).as(gtk.Widget));
+                };
+                break :leaf .initReused(window.as(gtk.Widget));
+            },
+            .split => |s| split: {
+                const left = self.buildTreeLegacy(tree, s.left);
+                defer left.deinit();
+                const right = self.buildTreeLegacy(tree, s.right);
                 defer right.deinit();
 
                 break :split .initNew(SplitTreeSplit.new(
@@ -1099,16 +1174,23 @@ const SplitTreeSplit = extern struct {
         // Our idle source is always over
         priv.idle = null;
 
-        // Get our split. This is the most dangerous part of this entire
-        // widget. We assume that this widget is always a child of a
-        // SplitTree, we assume that our handle is valid, and we assume
-        // the handle is always a split node.
+        // Get our split from the core tree. We assume that this widget is
+        // always a child of a SplitTree, our handle is valid, and the
+        // handle is always a split node.
         const split_tree = ext.getAncestor(
             SplitTree,
             self.as(gtk.Widget),
         ) orelse return 0;
-        const tree = split_tree.getTree() orelse return 0;
-        const split: *const Surface.Tree.Split = &tree.nodes[priv.handle.idx()].split;
+
+        // Prefer core tree, fall back to GTK tree during transition.
+        const core_tab = split_tree.getCoreTab();
+        const ratio_ptr: *const f16 = if (core_tab) |tab|
+            &tab.tree.nodes[priv.handle.idx()].split.ratio
+        else ratio: {
+            const tree = split_tree.getTree() orelse return 0;
+            break :ratio &tree.nodes[priv.handle.idx()].split.ratio;
+        };
+        const desired_ratio: f64 = @floatCast(ratio_ptr.*);
 
         // Current, min, and max positions as pixels.
         const pos = paned.getPosition();
@@ -1158,8 +1240,6 @@ const SplitTreeSplit = extern struct {
             const max_f64: f64 = @floatFromInt(max);
             break :ratio pos_f64 / max_f64;
         };
-        const desired_ratio: f64 = @floatCast(split.ratio);
-
         // If our ratio is close enough to our desired ratio, then
         // we ignore the update. This is to avoid constant split updates
         // for lossy floating point math.
@@ -1187,7 +1267,13 @@ const SplitTreeSplit = extern struct {
 
         // If we've set the position, then this is a manual human update
         // and we need to write our update back to the tree.
-        tree.resizeInPlace(priv.handle, @floatCast(current_ratio));
+        if (core_tab) |tab| {
+            const core_handle: CoreApp.SurfaceSplitTree.Node.Handle = @enumFromInt(@intFromEnum(priv.handle));
+            tab.tree.resizeInPlace(core_handle, @floatCast(current_ratio));
+        } else {
+            const tree = split_tree.getTree() orelse return 0;
+            tree.resizeInPlace(priv.handle, @floatCast(current_ratio));
+        }
 
         return 0;
     }

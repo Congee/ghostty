@@ -691,7 +691,7 @@ pub const Application = extern struct {
 
             .goto_window => return Action.gotoWindow(value),
 
-            .goto_tab => return Action.gotoTab(target, value),
+            .goto_tab => return Action.gotoTab(self, target, value),
 
             .initial_size => return Action.initialSize(target, value),
 
@@ -770,8 +770,9 @@ pub const Application = extern struct {
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
 
+            .focus_surface => return Action.focusSurface(value),
+
             // Unimplemented
-            .focus_surface,
             .secure_input,
             .close_all_windows,
             .float_window,
@@ -2038,29 +2039,51 @@ const Action = struct {
     }
 
     pub fn gotoTab(
+        app: *Application,
         target: apprt.Target,
         tab: apprt.action.GotoTab,
     ) bool {
         switch (target) {
             .app => return false,
-            .surface => |core| {
-                const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
-                    surface.as(gtk.Widget),
-                ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
-                    return false;
-                };
-
-                return window.selectTab(switch (tab) {
-                    .previous => .previous,
-                    .next => .next,
-                    .last => .last,
-                    else => .{ .n = @intCast(@intFromEnum(tab)) },
-                });
+            .surface => |_| {
+                // Resolve via core: goto_tab → target surface → focus_surface
+                const core_app = app.core();
+                const target_surface = core_app.resolveGotoTab(tab) orelse return false;
+                return focusSurface(.{ .surface = target_surface });
             },
         }
+    }
+
+    pub fn focusSurface(value: apprt.action.FocusSurface) bool {
+        const rt_surface = value.surface;
+        const gtk_surface = rt_surface.surface;
+
+        // Find the window containing this surface
+        const window = ext.getAncestor(
+            Window,
+            gtk_surface.as(gtk.Widget),
+        ) orelse {
+            log.warn("surface is not in a window, ignoring focus_surface", .{});
+            return false;
+        };
+
+        // Find the tab containing this surface and select it in TabView
+        const tab = ext.getAncestor(
+            Tab,
+            gtk_surface.as(gtk.Widget),
+        ) orelse return false;
+
+        const tab_view = window.getTabView();
+        const page = tab_view.getPage(tab.as(gtk.Widget));
+
+        const selected = tab_view.getSelectedPage();
+        if (selected != page) {
+            tab_view.setSelectedPage(page);
+        }
+
+        // Focus the specific surface
+        gtk_surface.grabFocus();
+        return true;
     }
 
     pub fn gotoWindow(direction: apprt.action.GotoWindow) bool {

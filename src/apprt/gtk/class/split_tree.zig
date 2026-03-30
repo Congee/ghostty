@@ -222,7 +222,9 @@ pub const SplitTree = extern struct {
             pub const none: @This() = .{};
         },
     ) Allocator.Error!void {
-        const alloc = Application.default().allocator();
+        // Set the split direction on core so addSurface uses the correct direction.
+        const core_app = Application.default().core();
+        core_app.pending_split_direction = @enumFromInt(@intFromEnum(direction));
 
         // Create our new surface.
         const surface: *Surface = .new(.{
@@ -248,42 +250,40 @@ pub const SplitTree = extern struct {
             .{ .sync_create = true },
         );
 
-        // Create our tree
+        // Connect to surface init signal so we rebuild after core's
+        // addSurface has added this surface to the core tree.
+        _ = Surface.signals.init.connect(
+            surface,
+            *Self,
+            surfaceInitialized,
+            self,
+            .{},
+        );
+
+        // Move focus to the new surface.
+        self.private().last_focused.set(surface);
+
+        // Build a temporary GTK tree for the legacy setTree path.
+        // This connects signal handlers and triggers the initial rebuild.
+        // Once the surface initializes, onRebuild will read from core tree.
+        const alloc = Application.default().allocator();
         var single_tree = try Surface.Tree.init(alloc, surface);
         defer single_tree.deinit();
 
-        // We want to move our focus to the new surface no matter what.
-        // But we need to be careful to restore state if we fail.
-        const old_last_focused = self.private().last_focused.get();
-        defer if (old_last_focused) |v| v.unref(); // unref strong ref from get
-        self.private().last_focused.set(surface);
-        errdefer self.private().last_focused.set(old_last_focused);
-
-        // If we have no tree yet, then this becomes our tree and we're done.
         const old_tree = self.getTree() orelse {
             self.setTree(&single_tree);
             return;
         };
 
-        // The handle we create the split relative to. Today this is the active
-        // surface but this might be the handle of the given parent if we want.
         const handle = self.getActiveSurfaceHandle() orelse .root;
-
-        // Create our split!
         var new_tree = try old_tree.split(
             alloc,
             handle,
             direction,
-            0.5, // Always split equally for new splits
+            0.5,
             &single_tree,
         );
         defer new_tree.deinit();
-        log.debug(
-            "new split at={} direction={} old_tree={f} new_tree={f}",
-            .{ handle, direction, old_tree, &new_tree },
-        );
-
-        // Replace our tree
         self.setTree(&new_tree);
     }
 
@@ -903,6 +903,16 @@ pub const SplitTree = extern struct {
             priv.last_focused.set(v);
             v.grabFocus();
         }
+    }
+
+    /// Called when a new surface completes initialization (after core addSurface).
+    /// Triggers a rebuild so the widget tree reflects the core tree state.
+    /// The init signal fires only once per surface, so no disconnect needed.
+    fn surfaceInitialized(
+        _: *Surface,
+        self: *Self,
+    ) callconv(.c) void {
+        self.triggerRebuild();
     }
 
     fn propSurfaceFocused(

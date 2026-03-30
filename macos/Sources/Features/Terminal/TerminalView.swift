@@ -30,6 +30,9 @@ protocol TerminalViewModel: ObservableObject {
     /// and children. This should be @Published.
     var surfaceTree: SplitTree<Ghostty.SurfaceView> { get set }
 
+    /// The core split tree for the currently active tab. Read-only view of core state.
+    var coreSplitTree: Ghostty.CoreSplitTree? { get }
+
     /// The command palette state.
     var commandPaletteIsShowing: Bool { get set }
 
@@ -80,7 +83,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                     }
 
                     TerminalSplitTreeView(
-                        tree: viewModel.surfaceTree,
+                        tree: viewModel.coreSplitTree
+                            ?? Ghostty.CoreSplitTree(app: ghostty.app!, tabIndex: 0),
                         action: { delegate?.performSplitAction($0) })
                         .environmentObject(ghostty)
                         .ghosttyLastFocusedSurface(lastFocusedSurface)

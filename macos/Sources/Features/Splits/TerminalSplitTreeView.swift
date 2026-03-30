@@ -9,7 +9,8 @@ enum TerminalSplitOperation {
     case drop(Drop)
 
     struct Resize {
-        let node: SplitTree<Ghostty.SurfaceView>.Node
+        /// The handle of the split node being resized in the core tree.
+        let handle: UInt16
         let ratio: Double
     }
 
@@ -26,63 +27,70 @@ enum TerminalSplitOperation {
 }
 
 struct TerminalSplitTreeView: View {
-    let tree: SplitTree<Ghostty.SurfaceView>
+    let tree: Ghostty.CoreSplitTree
     let action: (TerminalSplitOperation) -> Void
 
     var body: some View {
-        if let node = tree.zoomed ?? tree.root {
-            TerminalSplitSubtreeView(
-                node: node,
-                isRoot: node == tree.root,
+        if let root = tree.root {
+            // TODO: handle zoom — for now show root
+            CoreSplitSubtreeView(
+                node: root,
+                isRoot: true,
                 action: action)
-            // This is necessary because we can't rely on SwiftUI's implicit
-            // structural identity to detect changes to this view. Due to
-            // the tree structure of splits it could result in bad behaviors.
-            // See: https://github.com/ghostty-org/ghostty/issues/7546
-            .id(node.structuralIdentity)
+            .id(root.structuralIdentity)
         }
     }
 }
 
-private struct TerminalSplitSubtreeView: View {
+private struct CoreSplitSubtreeView: View {
     @EnvironmentObject var ghostty: Ghostty.App
 
-    let node: SplitTree<Ghostty.SurfaceView>.Node
+    let node: Ghostty.CoreSplitTree.Node
     var isRoot: Bool = false
     let action: (TerminalSplitOperation) -> Void
 
     var body: some View {
-        switch node {
-        case .leaf(let leafView):
-            TerminalSplitLeaf(surfaceView: leafView, isSplit: !isRoot, action: action)
-
-        case .split(let split):
-            let splitViewDirection: SplitViewDirection = switch split.direction {
-            case .horizontal: .horizontal
-            case .vertical: .vertical
+        if node.isLeaf {
+            if let surfaceView = node.surfaceView {
+                TerminalSplitLeaf(surfaceView: surfaceView, isSplit: !isRoot, action: action)
             }
+        } else {
+            let splitViewDirection: SplitViewDirection = node.isHorizontal ? .horizontal : .vertical
 
             SplitView(
                 splitViewDirection,
                 .init(get: {
-                    CGFloat(split.ratio)
+                    CGFloat(node.ratio)
                 }, set: {
-                    action(.resize(.init(node: node, ratio: $0)))
+                    action(.resize(.init(handle: node.handle, ratio: $0)))
                 }),
                 dividerColor: ghostty.config.splitDividerColor,
                 resizeIncrements: .init(width: 1, height: 1),
                 left: {
-                    TerminalSplitSubtreeView(node: split.left, action: action)
+                    if let left = node.left {
+                        CoreSplitSubtreeView(node: left, action: action)
+                    }
                 },
                 right: {
-                    TerminalSplitSubtreeView(node: split.right, action: action)
+                    if let right = node.right {
+                        CoreSplitSubtreeView(node: right, action: action)
+                    }
                 },
                 onEqualize: {
-                    guard let surface = node.leftmostLeaf().surface else { return }
-                    ghostty.splitEqualize(surface: surface)
+                    // Find first leaf surface for equalize
+                    if let leafSurface = findFirstLeafSurface(node) {
+                        ghostty.splitEqualize(surface: leafSurface)
+                    }
                 }
             )
         }
+    }
+
+    private func findFirstLeafSurface(_ n: Ghostty.CoreSplitTree.Node) -> Ghostty.SurfaceView? {
+        if n.isLeaf { return n.surfaceView }
+        if let left = n.left { return findFirstLeafSurface(left) }
+        if let right = n.right { return findFirstLeafSurface(right) }
+        return nil
     }
 }
 

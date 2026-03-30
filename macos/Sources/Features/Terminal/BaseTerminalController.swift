@@ -49,6 +49,14 @@ class BaseTerminalController: NSWindowController,
     /// Zig owns tab identity and ordering; Swift just holds the views.
     private(set) var allTrees: [SplitTree<Ghostty.SurfaceView>] = []
 
+    /// The core split tree for the currently active tab. Read from core via C API.
+    var coreSplitTree: Ghostty.CoreSplitTree? {
+        guard let app = ghostty.app else { return nil }
+        let activeIdx = ghostty_app_active_tab_index(app)
+        guard activeIdx >= 0 else { return nil }
+        return Ghostty.CoreSplitTree(app: app, tabIndex: UInt32(activeIdx))
+    }
+
     /// True while switchToTree is executing, suppresses allTrees updates
     /// in surfaceTreeDidChange to avoid dropping the old tree.
     private var isSwitchingTrees = false
@@ -984,19 +992,18 @@ class BaseTerminalController: NSWindowController,
     func performSplitAction(_ action: TerminalSplitOperation) {
         switch action {
         case .resize(let resize):
-            splitDidResize(node: resize.node, to: resize.ratio)
+            splitDidResize(handle: resize.handle, to: resize.ratio)
         case .drop(let drop):
             splitDidDrop(source: drop.payload, destination: drop.destination, zone: drop.zone)
         }
     }
 
-    private func splitDidResize(node: SplitTree<Ghostty.SurfaceView>.Node, to newRatio: Double) {
-        let resizedNode = node.resizing(to: newRatio)
-        do {
-            surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
-        } catch {
-            Ghostty.logger.warning("failed to replace node during split resize: \(error)")
-        }
+    private func splitDidResize(handle: UInt16, to newRatio: Double) {
+        // TODO: Write ratio to core tree via App.resizeSplitInPlace.
+        // For now this is a no-op since we're transitioning from Swift tree
+        // to core tree. The Swift tree is still used for the legacy path.
+        _ = handle
+        _ = newRatio
     }
 
     private func splitDidDrop(

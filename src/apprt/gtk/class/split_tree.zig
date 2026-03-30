@@ -283,14 +283,9 @@ pub const SplitTree = extern struct {
         direction: Surface.Tree.Split.Direction,
         amount: u16,
     ) Allocator.Error!bool {
-        // Avoid useless work
         if (amount == 0) return false;
 
-        const old_tree = self.getTree() orelse return false;
-        const active = self.getActiveSurfaceHandle() orelse return false;
-
-        // Get all our dimensions we're going to need to turn our
-        // amount into a percentage.
+        // Get widget dimensions for ratio computation.
         const priv = self.private();
         const width = priv.tree_bin.as(gtk.Widget).getWidth();
         const height = priv.tree_bin.as(gtk.Widget).getHeight();
@@ -299,7 +294,6 @@ pub const SplitTree = extern struct {
         const height_f64: f64 = @floatFromInt(height);
         const amount_f64: f64 = @floatFromInt(amount);
 
-        // Get our ratio and use positive/neg for directions.
         const ratio: f64 = switch (direction) {
             .right => amount_f64 / width_f64,
             .left => -(amount_f64 / width_f64),
@@ -307,15 +301,31 @@ pub const SplitTree = extern struct {
             .up => -(amount_f64 / height_f64),
         };
 
-        const layout: Surface.Tree.Split.Layout = switch (direction) {
+        const layout: CoreApp.SurfaceSplitTree.Split.Layout = switch (direction) {
             .left, .right => .horizontal,
             .up, .down => .vertical,
         };
 
+        // Try core path first
+        if (self.getActiveSurface()) |surface| {
+            if (surface.core()) |core| {
+                const core_app = Application.default().core();
+                const result = try core_app.resizeSplit(core.rt_surface, layout, @floatCast(ratio));
+                if (result) self.triggerRebuild();
+                return result;
+            }
+        }
+        // Legacy fallback
+        const old_tree = self.getTree() orelse return false;
+        const active = self.getActiveSurfaceHandle() orelse return false;
+        const gtk_layout: Surface.Tree.Split.Layout = switch (direction) {
+            .left, .right => .horizontal,
+            .up, .down => .vertical,
+        };
         var new_tree = try old_tree.resize(
             Application.default().allocator(),
             active,
-            layout,
+            gtk_layout,
             @floatCast(ratio),
         );
         defer new_tree.deinit();
@@ -381,41 +391,78 @@ pub const SplitTree = extern struct {
     }
 
     fn disconnectSurfaceHandlers(self: *Self) void {
-        const tree = self.getTree() orelse return;
-        var it = tree.iterator();
-        while (it.next()) |entry| {
-            const surface = entry.view;
-            _ = gobject.signalHandlersDisconnectMatched(
-                surface.as(gobject.Object),
-                .{ .data = true },
-                0,
-                0,
-                null,
-                null,
-                self,
-            );
+        // Prefer core tree, fall back to GTK tree
+        if (self.getCoreTab()) |tab| {
+            var it = tab.surfaceIterator();
+            while (it.next()) |rt_surface| {
+                const surface = rt_surface.surface;
+                _ = gobject.signalHandlersDisconnectMatched(
+                    surface.as(gobject.Object),
+                    .{ .data = true },
+                    0,
+                    0,
+                    null,
+                    null,
+                    self,
+                );
+            }
+        } else {
+            const tree = self.getTree() orelse return;
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                _ = gobject.signalHandlersDisconnectMatched(
+                    entry.view.as(gobject.Object),
+                    .{ .data = true },
+                    0,
+                    0,
+                    null,
+                    null,
+                    self,
+                );
+            }
         }
     }
 
     fn connectSurfaceHandlers(self: *Self) void {
-        const tree = self.getTree() orelse return;
-        var it = tree.iterator();
-        while (it.next()) |entry| {
-            const surface = entry.view;
-            _ = Surface.signals.@"close-request".connect(
-                surface,
-                *Self,
-                surfaceCloseRequest,
-                self,
-                .{},
-            );
-            _ = gobject.Object.signals.notify.connect(
-                surface,
-                *Self,
-                propSurfaceFocused,
-                self,
-                .{ .detail = "focused" },
-            );
+        // Prefer core tree, fall back to GTK tree
+        if (self.getCoreTab()) |tab| {
+            var it = tab.surfaceIterator();
+            while (it.next()) |rt_surface| {
+                const surface = rt_surface.surface;
+                _ = Surface.signals.@"close-request".connect(
+                    surface,
+                    *Self,
+                    surfaceCloseRequest,
+                    self,
+                    .{},
+                );
+                _ = gobject.Object.signals.notify.connect(
+                    surface,
+                    *Self,
+                    propSurfaceFocused,
+                    self,
+                    .{ .detail = "focused" },
+                );
+            }
+        } else {
+            const tree = self.getTree() orelse return;
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                _ = Surface.signals.@"close-request".connect(
+                    entry.view,
+                    *Self,
+                    surfaceCloseRequest,
+                    self,
+                    .{},
+                );
+                _ = gobject.Object.signals.notify.connect(
+                    entry.view,
+                    *Self,
+                    propSurfaceFocused,
+                    self,
+                    .{ .detail = "focused" },
+                );
+            }
         }
     }
 
@@ -441,6 +488,17 @@ pub const SplitTree = extern struct {
     /// Get the currently active surface. See the "active-surface" property.
     /// This does not ref the value.
     pub fn getActiveSurface(self: *Self) ?*Surface {
+        // Prefer core tree
+        if (self.getCoreTab()) |tab| {
+            const core_app = Application.default().core();
+            // If core has a focused surface in this tab, use it
+            if (core_app.focused_surface) |focused| {
+                if (tab.containsSurface(focused)) {
+                    return focused.rt_surface.surface;
+                }
+            }
+        }
+        // Fall back to GTK tree iteration
         const tree = self.getTree() orelse return null;
         const handle = self.getActiveSurfaceHandle() orelse return null;
         return tree.nodes[handle.idx()].leaf;
@@ -480,11 +538,13 @@ pub const SplitTree = extern struct {
     }
 
     pub fn getHasSurfaces(self: *Self) bool {
+        if (self.getCoreTab()) |tab| return !tab.tree.isEmpty();
         const tree: *const Surface.Tree = self.private().tree orelse &.empty;
         return !tree.isEmpty();
     }
 
     pub fn getIsZoomed(self: *Self) bool {
+        if (self.getCoreTab()) |tab| return tab.tree.zoomed != null;
         const tree: *const Surface.Tree = self.private().tree orelse &.empty;
         return tree.zoomed != null;
     }
@@ -549,12 +609,16 @@ pub const SplitTree = extern struct {
     }
 
     pub fn getIsSplit(self: *Self) bool {
+        if (self.getCoreTab()) |tab| {
+            if (tab.tree.isEmpty()) return false;
+            return switch (tab.tree.nodes[0]) {
+                .leaf => false,
+                .split => true,
+            };
+        }
         const tree: *const Surface.Tree = self.private().tree orelse &.empty;
         if (tree.isEmpty()) return false;
-
-        const root_handle: Surface.Tree.Node.Handle = .root;
-        const root = tree.nodes[root_handle.idx()];
-        return switch (root) {
+        return switch (tree.nodes[0]) {
             .leaf => false,
             .split => true,
         };
@@ -638,6 +702,19 @@ pub const SplitTree = extern struct {
     ) callconv(.c) void {
         _ = parameter_;
 
+        // Try core path first
+        if (self.getActiveSurface()) |surface| {
+            if (surface.core()) |core| {
+                const core_app = Application.default().core();
+                _ = core_app.equalizeSplits(core.rt_surface) catch |err| {
+                    log.warn("unable to equalize splits via core: {}", .{err});
+                    return;
+                };
+                self.triggerRebuild();
+                return;
+            }
+        }
+        // Legacy fallback
         const old_tree = self.getTree() orelse return;
         var new_tree = old_tree.equalize(Application.default().allocator()) catch |err| {
             log.warn("unable to equalize tree: {}", .{err});
@@ -652,6 +729,16 @@ pub const SplitTree = extern struct {
         _: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
+        // Try core path first
+        if (self.getActiveSurface()) |surface| {
+            if (surface.core()) |core| {
+                const core_app = Application.default().core();
+                _ = core_app.toggleZoom(core.rt_surface);
+                self.triggerRebuild();
+                return;
+            }
+        }
+        // Legacy fallback
         const tree = self.getTree() orelse return;
         if (tree.zoomed != null) {
             tree.zoomed = null;
@@ -660,7 +747,6 @@ pub const SplitTree = extern struct {
             if (tree.zoomed == active) return;
             tree.zoom(active);
         }
-
         self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
     }
 
@@ -765,6 +851,33 @@ pub const SplitTree = extern struct {
 
         // Our active surface probably changed
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    /// Trigger a widget rebuild from core tree state. Used after core
+    /// mutations (equalize, zoom, resize, etc.) to update the GTK widgets.
+    fn triggerRebuild(self: *Self) void {
+        const priv = self.private();
+
+        // Disconnect old handlers, reconnect after rebuild
+        self.disconnectSurfaceHandlers();
+        self.connectSurfaceHandlers();
+
+        // Notify property changes
+        self.as(gobject.Object).freezeNotify();
+        defer self.as(gobject.Object).thawNotify();
+        self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+
+        // Schedule rebuild if not already scheduled
+        if (priv.rebuild_source) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove rebuild source", .{});
+            }
+            priv.rebuild_source = null;
+        }
+        priv.rebuild_source = glib.idleAdd(onRebuild, self);
     }
 
     fn propTree(

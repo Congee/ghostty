@@ -22,6 +22,14 @@ const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScro
 
 const log = std.log.scoped(.gtk_ghostty_split_tree);
 
+/// Convert between core and GTK tree node handles (structurally identical enum(u16) types).
+fn coreHandle(gtk_h: Surface.Tree.Node.Handle) CoreApp.SurfaceSplitTree.Node.Handle {
+    return @enumFromInt(@intFromEnum(gtk_h));
+}
+fn gtkHandle(core_h: CoreApp.SurfaceSplitTree.Node.Handle) Surface.Tree.Node.Handle {
+    return @enumFromInt(@intFromEnum(core_h));
+}
+
 pub const SplitTree = extern struct {
     const Self = @This();
     parent_instance: Parent,
@@ -810,7 +818,7 @@ pub const SplitTree = extern struct {
             if (core_app.tabForSurface(core)) |tab| {
                 if (tab.findHandleByCore(core)) |h| {
                     // Cast core handle to GTK handle (same underlying type)
-                    break :handle @as(Surface.Tree.Node.Handle, @enumFromInt(@intFromEnum(h)));
+                    break :handle gtkHandle(h);
                 }
             }
             // Legacy fallback
@@ -857,15 +865,15 @@ pub const SplitTree = extern struct {
         var next_focus: ?*Surface = null;
 
         if (self.getCoreTab()) |tab| {
-            const core_handle: CoreApp.SurfaceSplitTree.Node.Handle = @enumFromInt(@intFromEnum(handle));
-            closing_core = tab.tree.nodes[core_handle.idx()].leaf.surface.core();
+            closing_core = tab.tree.nodes[coreHandle(handle).idx()].leaf.surface.core();
 
             // Find next focus target in core tree
+            const ch = coreHandle(handle);
             const next_handle: CoreApp.SurfaceSplitTree.Node.Handle =
-                (tab.tree.goto(alloc, core_handle, .previous) catch null) orelse
-                (tab.tree.goto(alloc, core_handle, .next) catch null) orelse
-                core_handle;
-            if (next_handle != core_handle) {
+                (tab.tree.goto(alloc, ch, .previous) catch null) orelse
+                (tab.tree.goto(alloc, ch, .next) catch null) orelse
+                ch;
+            if (next_handle != ch) {
                 next_focus = tab.tree.nodes[next_handle.idx()].leaf.surface.surface;
             }
         } else {
@@ -981,16 +989,17 @@ pub const SplitTree = extern struct {
 
     /// Find the core App.Tab for this split tree by looking up any surface
     /// in the current GTK tree through the core App's tab list.
+    /// NOTE: Must not call getActiveSurface (which calls getCoreTab → infinite recursion).
     fn getCoreTab(self: *Self) ?*CoreApp.Tab {
         const core_app = Application.default().core();
-        const surface = self.getActiveSurface() orelse {
-            // No active surface — try last_focused
-            const lf = self.private().last_focused.get() orelse return null;
-            defer lf.unref();
-            const core = lf.core() orelse return null;
-            return core_app.tabForSurface(core);
-        };
-        const core = surface.core() orelse return null;
+        // Try focused_surface directly — no getActiveSurface call
+        if (core_app.focused_surface) |focused| {
+            if (core_app.tabForSurface(focused)) |tab| return tab;
+        }
+        // Fall back to last_focused
+        const lf = self.private().last_focused.get() orelse return null;
+        defer lf.unref();
+        const core = lf.core() orelse return null;
         return core_app.tabForSurface(core);
     }
 
@@ -1112,9 +1121,9 @@ pub const SplitTree = extern struct {
                 const right = self.buildTree(tree, s.right);
                 defer right.deinit();
 
-                // Cast from CoreApp.SurfaceSplitTree types to Surface.Tree types.
-                // These are structurally identical (same Layout, f16, Handle).
-                const handle: Surface.Tree.Node.Handle = @enumFromInt(@intFromEnum(current));
+                // Cast between core and GTK tree types (structurally identical).
+                comptime assert(@sizeOf(CoreApp.SurfaceSplitTree.Split) == @sizeOf(Surface.Tree.Split));
+                const handle = gtkHandle(current);
                 const gtk_split: *const Surface.Tree.Split = @ptrCast(&s);
 
                 break :split .initNew(SplitTreeSplit.new(
@@ -1440,7 +1449,7 @@ const SplitTreeSplit = extern struct {
         // If we've set the position, then this is a manual human update
         // and we need to write our update back to the tree.
         if (core_tab) |tab| {
-            const core_handle: CoreApp.SurfaceSplitTree.Node.Handle = @enumFromInt(@intFromEnum(priv.handle));
+            const core_handle = coreHandle(priv.handle);
             tab.tree.resizeInPlace(core_handle, @floatCast(current_ratio));
         } else {
             const tree = split_tree.getTree() orelse return 0;

@@ -83,6 +83,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                     }
 
                     TerminalSplitTreeView(
+                        // coreSplitTree reads from core; fallback to tab 0 during init.
+                        // ghostty.app is guaranteed non-nil inside .ready state.
                         tree: viewModel.coreSplitTree
                             ?? Ghostty.CoreSplitTree(app: ghostty.app!, tabIndex: 0),
                         action: { delegate?.performSplitAction($0) })

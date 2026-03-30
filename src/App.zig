@@ -123,12 +123,7 @@ pub const Tab = struct {
 
     /// Whether this tab contains the given core surface.
     pub fn containsSurface(self: *const Tab, surface: *const Surface) bool {
-        var iter = self.tree.iterator();
-        while (iter.next()) |entry| {
-            const core = entry.view.surface.surface.core() orelse continue;
-            if (core == surface) return true;
-        }
-        return false;
+        return self.findHandleByCore(surface) != null;
     }
 };
 

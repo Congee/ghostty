@@ -1508,6 +1508,8 @@ pub const Window = extern struct {
         if (tab.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+        // If getSurfaceTree returns null (init timing), handlers will
+        // be connected when tabSplitTreeChanged fires after setTree.
     }
 
     fn tabViewPageDetached(

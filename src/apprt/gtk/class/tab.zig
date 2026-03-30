@@ -366,15 +366,14 @@ pub const Tab = extern struct {
     // Signal handlers
 
     fn propSplitTree(
-        _: *SplitTree,
+        split_tree: *SplitTree,
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
         self.as(gobject.Object).notifyByPspec(properties.@"surface-tree".impl.param_spec);
 
         // If our tree is empty we close the tab.
-        const tree: *const Surface.Tree = self.getSurfaceTree() orelse &.empty;
-        if (tree.isEmpty()) {
+        if (!split_tree.getHasSurfaces()) {
             signals.@"close-request".impl.emit(
                 self,
                 null,

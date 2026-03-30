@@ -491,14 +491,8 @@ pub const Window = extern struct {
             .{},
         );
 
-        // Run an initial notification for the surface tree so we can setup
-        // initial state.
-        tabSplitTreeChanged(
-            split_tree,
-            null,
-            split_tree.getTree(),
-            self,
-        );
+        // Connect surface handlers for the initial tree.
+        self.connectSurfaceHandlersFromSplitTree(split_tree);
 
         return page;
     }
@@ -760,18 +754,37 @@ pub const Window = extern struct {
         self.private().toast_overlay.addToast(toast);
     }
 
-    fn connectSurfaceHandlers(
+    fn connectSurfaceHandlersFromTree(
         self: *Self,
         tree: *const Surface.Tree,
     ) void {
-        const priv = self.private();
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
-            // Before adding any new signal handlers, disconnect any that we may
-            // have added before. Otherwise we may get multiple handlers for the
-            // same signal.
-            _ = gobject.signalHandlersDisconnectMatched(
+            self.connectSurfaceHandler(entry.view);
+        }
+    }
+
+    fn connectSurfaceHandlersFromSplitTree(
+        self: *Self,
+        split_tree: *SplitTree,
+    ) void {
+        if (split_tree.getCoreTab()) |tab| {
+            var it = tab.surfaceIterator();
+            while (it.next()) |rt_surface| {
+                self.connectSurfaceHandler(rt_surface.surface);
+            }
+        } else if (split_tree.getTree()) |tree| {
+            self.connectSurfaceHandlersFromTree(tree);
+        }
+    }
+
+    fn connectSurfaceHandler(self: *Self, surface: *Surface) void {
+        const priv = self.private();
+
+        // Before adding any new signal handlers, disconnect any that we may
+        // have added before. Otherwise we may get multiple handlers for the
+        // same signal.
+        _ = gobject.signalHandlersDisconnectMatched(
                 surface.as(gobject.Object),
                 .{ .data = true },
                 0,
@@ -830,21 +843,16 @@ pub const Window = extern struct {
                     .{},
                 );
             }
-        }
     }
 
-    /// Disconnect all the surface handlers for the given tree. This should
-    /// be called whenever a tree is no longer present in the window, e.g.
-    /// when a tab is detached or the tree changes.
-    fn disconnectSurfaceHandlers(
+    fn disconnectSurfaceHandlersFromTree(
         self: *Self,
         tree: *const Surface.Tree,
     ) void {
         var it = tree.iterator();
         while (it.next()) |entry| {
-            const surface = entry.view;
             _ = gobject.signalHandlersDisconnectMatched(
-                surface.as(gobject.Object),
+                entry.view.as(gobject.Object),
                 .{ .data = true },
                 0,
                 0,
@@ -852,6 +860,28 @@ pub const Window = extern struct {
                 null,
                 self,
             );
+        }
+    }
+
+    fn disconnectSurfaceHandlersFromSplitTree(
+        self: *Self,
+        split_tree: *SplitTree,
+    ) void {
+        if (split_tree.getCoreTab()) |tab| {
+            var it = tab.surfaceIterator();
+            while (it.next()) |rt_surface| {
+                _ = gobject.signalHandlersDisconnectMatched(
+                    rt_surface.surface.as(gobject.Object),
+                    .{ .data = true },
+                    0,
+                    0,
+                    null,
+                    null,
+                    self,
+                );
+            }
+        } else if (split_tree.getTree()) |tree| {
+            self.disconnectSurfaceHandlersFromTree(tree);
         }
     }
 
@@ -1505,11 +1535,7 @@ pub const Window = extern struct {
         // behavior is consistent with macOS and the previous GTK apprt,
         // but that behavior was all implicit and not documented, so here
         // I am.
-        if (tab.getSurfaceTree()) |tree| {
-            self.connectSurfaceHandlers(tree);
-        }
-        // If getSurfaceTree returns null (init timing), handlers will
-        // be connected when tabSplitTreeChanged fires after setTree.
+        self.connectSurfaceHandlersFromSplitTree(tab.getSplitTree());
     }
 
     fn tabViewPageDetached(
@@ -1532,9 +1558,7 @@ pub const Window = extern struct {
         );
 
         // Remove the tree handlers
-        if (tab.getSurfaceTree()) |tree| {
-            self.disconnectSurfaceHandlers(tree);
-        }
+        self.disconnectSurfaceHandlersFromSplitTree(tab.getSplitTree());
     }
 
     fn tabViewCreateWindow(
@@ -1723,18 +1747,15 @@ pub const Window = extern struct {
     }
 
     fn tabSplitTreeChanged(
-        _: *SplitTree,
-        old_tree: ?*const Surface.Tree,
-        new_tree: ?*const Surface.Tree,
+        split_tree: *SplitTree,
+        _: ?*const Surface.Tree,
+        _: ?*const Surface.Tree,
         self: *Self,
     ) callconv(.c) void {
-        if (old_tree) |tree| {
-            self.disconnectSurfaceHandlers(tree);
-        }
-
-        if (new_tree) |tree| {
-            self.connectSurfaceHandlers(tree);
-        }
+        // Disconnect old handlers and reconnect to current surfaces.
+        // Uses core tree when available, falls back to GTK tree.
+        self.disconnectSurfaceHandlersFromSplitTree(split_tree);
+        self.connectSurfaceHandlersFromSplitTree(split_tree);
     }
 
     fn actionAbout(

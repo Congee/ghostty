@@ -1000,7 +1000,7 @@ pub const SplitTree = extern struct {
     /// Find the core App.Tab for this split tree by looking up any surface
     /// in the current GTK tree through the core App's tab list.
     /// NOTE: Must not call getActiveSurface (which calls getCoreTab → infinite recursion).
-    fn getCoreTab(self: *Self) ?*CoreApp.Tab {
+    pub fn getCoreTab(self: *Self) ?*CoreApp.Tab {
         const core_app = Application.default().core();
         // Try focused_surface directly — no getActiveSurface call
         if (core_app.focused_surface) |focused| {

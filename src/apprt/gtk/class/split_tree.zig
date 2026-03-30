@@ -8,6 +8,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const CoreApp = @import("../../../App.zig");
+const CoreSurface = @import("../../../Surface.zig");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
 const ext = @import("../ext.zig");
@@ -510,16 +511,21 @@ pub const SplitTree = extern struct {
     /// Returns true if this split tree needs confirmation before quitting based
     /// on the various Ghostty configurations.
     pub fn getNeedsConfirmQuit(self: *Self) bool {
+        if (self.getCoreTab()) |tab| {
+            var it = tab.surfaceIterator();
+            while (it.next()) |rt_surface| {
+                if (rt_surface.core().needsConfirmQuit()) return true;
+            }
+            return false;
+        }
+        // Legacy fallback
         const tree = self.getTree() orelse return false;
         var it = tree.iterator();
         while (it.next()) |entry| {
             if (entry.view.core()) |core| {
-                if (core.needsConfirmQuit()) {
-                    return true;
-                }
+                if (core.needsConfirmQuit()) return true;
             }
         }
-
         return false;
     }
 
@@ -798,17 +804,21 @@ pub const SplitTree = extern struct {
         const priv = self.private();
         priv.pending_close = null;
 
-        // Find the surface in the tree to verify this is valid and
-        // set our pending close handle.
+        // Find the surface handle — prefer core tree, fall back to GTK tree.
         priv.pending_close = handle: {
+            const core_app = Application.default().core();
+            if (core_app.tabForSurface(core)) |tab| {
+                if (tab.findHandleByCore(core)) |h| {
+                    // Cast core handle to GTK handle (same underlying type)
+                    break :handle @as(Surface.Tree.Node.Handle, @enumFromInt(@intFromEnum(h)));
+                }
+            }
+            // Legacy fallback
             const tree = self.getTree() orelse return;
             var it = tree.iterator();
             while (it.next()) |entry| {
-                if (entry.view == surface) {
-                    break :handle entry.handle;
-                }
+                if (entry.view == surface) break :handle entry.handle;
             }
-
             return;
         };
 
@@ -840,27 +850,42 @@ pub const SplitTree = extern struct {
         const priv = self.private();
         const handle = priv.pending_close orelse return;
         priv.pending_close = null;
+        const alloc = Application.default().allocator();
 
-        // Get the surface being closed from the GTK tree.
-        const old_tree = self.getTree() orelse return;
-        const closing_surface: *Surface = old_tree.nodes[handle.idx()].leaf;
+        // Find the surface and next focus target. Prefer core tree.
+        var closing_core: ?*CoreSurface = null;
+        var next_focus: ?*Surface = null;
 
-        // Figure out next focus target before removal.
-        const next_focus: ?*Surface = next_focus: {
-            const alloc = Application.default().allocator();
-            const next_handle: Surface.Tree.Node.Handle =
+        if (self.getCoreTab()) |tab| {
+            const core_handle: CoreApp.SurfaceSplitTree.Node.Handle = @enumFromInt(@intFromEnum(handle));
+            closing_core = tab.tree.nodes[core_handle.idx()].leaf.surface.core();
+
+            // Find next focus target in core tree
+            const next_handle: CoreApp.SurfaceSplitTree.Node.Handle =
+                (tab.tree.goto(alloc, core_handle, .previous) catch null) orelse
+                (tab.tree.goto(alloc, core_handle, .next) catch null) orelse
+                core_handle;
+            if (next_handle != core_handle) {
+                next_focus = tab.tree.nodes[next_handle.idx()].leaf.surface.surface;
+            }
+        } else {
+            // Legacy fallback
+            const old_tree = self.getTree() orelse return;
+            if (old_tree.nodes[handle.idx()] == .leaf) {
+                const leaf_surface = old_tree.nodes[handle.idx()].leaf;
+                closing_core = leaf_surface.core();
+            }
+            const next_h: Surface.Tree.Node.Handle =
                 (old_tree.goto(alloc, handle, .previous) catch null) orelse
                 (old_tree.goto(alloc, handle, .next) catch null) orelse
-                break :next_focus null;
-            if (next_handle == handle) break :next_focus null;
-            break :next_focus old_tree.nodes[next_handle.idx()].leaf;
-        };
-
-        // Close the surface. Core's deleteSurface removes it from the
-        // core tree and cleans up. The surface close triggers destruction.
-        if (closing_surface.core()) |core| {
-            core.close();
+                handle;
+            if (next_h != handle) {
+                next_focus = old_tree.nodes[next_h.idx()].leaf;
+            }
         }
+
+        // Close the surface via core.
+        if (closing_core) |core| core.close();
 
         // Trigger widget rebuild from core tree.
         self.triggerRebuild();

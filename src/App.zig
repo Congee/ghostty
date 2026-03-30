@@ -92,7 +92,8 @@ pub const Tab = struct {
     pub fn findHandleByCore(self: *const Tab, surface: *const Surface) ?SurfaceSplitTree.Node.Handle {
         var iter = self.tree.iterator();
         while (iter.next()) |entry| {
-            if (entry.view.surface.core() == surface) return entry.handle;
+            const core = entry.view.surface.surface.core() orelse continue;
+            if (core == surface) return entry.handle;
         }
         return null;
     }
@@ -102,7 +103,7 @@ pub const Tab = struct {
     pub fn representativeSurface(self: *const Tab) ?*Surface {
         var iter = self.tree.iterator();
         while (iter.next()) |entry| {
-            const core = entry.view.surface.core();
+            const core = entry.view.surface.surface.core() orelse continue;
             if (!core.closing) return core;
         }
         return null;
@@ -124,7 +125,8 @@ pub const Tab = struct {
     pub fn containsSurface(self: *const Tab, surface: *const Surface) bool {
         var iter = self.tree.iterator();
         while (iter.next()) |entry| {
-            if (entry.view.surface.core() == surface) return true;
+            const core = entry.view.surface.surface.core() orelse continue;
+            if (core == surface) return true;
         }
         return false;
     }
@@ -553,6 +555,72 @@ pub fn focusSurface(self: *App, surface: *Surface) void {
     if (changed) self.sendTabsUpdate();
 }
 
+/// Resize a split pane in the given direction by a ratio (-1..1).
+/// The ratio is pre-computed by the apprt from pixel amounts and widget dimensions.
+/// Returns true if the resize was applied.
+pub fn resizeSplit(
+    self: *App,
+    rt_surface: *apprt.Surface,
+    layout: SurfaceSplitTree.Split.Layout,
+    ratio: f16,
+) !bool {
+    const tab = self.tabForRtSurface(rt_surface) orelse return false;
+    const handle = tab.findHandle(rt_surface) orelse return false;
+    const new_tree = try tab.tree.resize(self.alloc, handle, layout, ratio);
+    tab.tree.deinit();
+    tab.tree = new_tree;
+    tab.tree_version +%= 1;
+    return true;
+}
+
+/// Equalize all splits in the tab containing the given surface.
+pub fn equalizeSplits(self: *App, rt_surface: *apprt.Surface) !bool {
+    const tab = self.tabForRtSurface(rt_surface) orelse return false;
+    const new_tree = try tab.tree.equalize(self.alloc);
+    tab.tree.deinit();
+    tab.tree = new_tree;
+    tab.tree_version +%= 1;
+    return true;
+}
+
+/// Toggle zoom on the focused surface within its tab.
+pub fn toggleZoom(self: *App, rt_surface: *apprt.Surface) bool {
+    const tab = self.tabForRtSurface(rt_surface) orelse return false;
+    const handle = tab.findHandle(rt_surface) orelse return false;
+    if (tab.tree.zoomed) |z| {
+        if (z == handle) {
+            tab.tree.zoom(null);
+        } else {
+            tab.tree.zoom(handle);
+        }
+    } else {
+        tab.tree.zoom(handle);
+    }
+    tab.tree_version +%= 1;
+    return true;
+}
+
+/// Update a split ratio in-place (used during interactive drag resize).
+pub fn resizeSplitInPlace(
+    self: *App,
+    rt_surface: *apprt.Surface,
+    handle: SurfaceSplitTree.Node.Handle,
+    ratio: f16,
+) void {
+    const tab = self.tabForRtSurface(rt_surface) orelse return;
+    tab.tree.resizeInPlace(handle, ratio);
+    // Don't bump tree_version for in-place resize — it's cosmetic and
+    // the widget is already updated by the GtkPaned drag handler.
+}
+
+/// Find the tab containing the given apprt surface.
+fn tabForRtSurface(self: *App, rt_surface: *apprt.Surface) ?*Tab {
+    for (self.tabs.items) |*tab| {
+        if (tab.findHandle(rt_surface) != null) return tab;
+    }
+    return null;
+}
+
 fn redrawSurface(
     self: *App,
     rt_app: *apprt.App,
@@ -970,8 +1038,9 @@ pub fn wakeRenderers(self: *App) void {
     for (self.tabs.items) |tab| {
         var iter = tab.surfaceIterator();
         while (iter.next()) |surface| {
-            if (surface.core_surface.closing) continue;
-            surface.core_surface.queueRender() catch {};
+            const cs = surface.core();
+            if (cs.closing) continue;
+            cs.queueRender() catch {};
         }
     }
 }

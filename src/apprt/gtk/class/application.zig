@@ -771,6 +771,7 @@ pub const Application = extern struct {
             .search_selected => Action.searchSelected(target, value),
 
             // Unimplemented
+            .focus_surface,
             .secure_input,
             .close_all_windows,
             .float_window,

@@ -1495,6 +1495,12 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        // Notify core of the selection change (user clicked a tab).
+        const page_idx = priv.tab_view.getPagePosition(page);
+        if (page_idx >= 0) {
+            _ = Application.default().core().selectTab(@intCast(page_idx));
+        }
     }
 
     fn tabViewPageAttached(

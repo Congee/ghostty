@@ -1912,12 +1912,35 @@ const Action = struct {
         switch (target) {
             .app => return false,
             .surface => |core| {
-                const surface = core.rt_surface.surface;
-                return surface.as(gtk.Widget).activateAction(
-                    "tab.close",
-                    glib.ext.VariantType.stringFor([:0]const u8),
-                    @as([*:0]const u8, @tagName(value)),
-                ) != 0;
+                const core_app = Application.default().core();
+
+                switch (value) {
+                    .this => {
+                        const idx = core_app.active_tab_index orelse return false;
+                        const result = core_app.closeTab(idx);
+                        switch (result) {
+                            .closed => return true,
+                            .needs_confirm => {
+                                // Fall through to GTK confirmation dialog
+                                const surface = core.rt_surface.surface;
+                                return surface.as(gtk.Widget).activateAction(
+                                    "tab.close",
+                                    glib.ext.VariantType.stringFor([:0]const u8),
+                                    @as([*:0]const u8, @tagName(value)),
+                                ) != 0;
+                            },
+                        }
+                    },
+                    // other/right modes still use GTK path for now
+                    .other, .right => {
+                        const surface = core.rt_surface.surface;
+                        return surface.as(gtk.Widget).activateAction(
+                            "tab.close",
+                            glib.ext.VariantType.stringFor([:0]const u8),
+                            @as([*:0]const u8, @tagName(value)),
+                        ) != 0;
+                    },
+                }
             },
         }
     }

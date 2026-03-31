@@ -3,6 +3,8 @@
   "private": true,
   "scripts": {
     "test:gtk": "bun run specs/gtk/terminal.spec.ts",
+    "test:gtk:tabs": "bun run specs/gtk/tabs.spec.ts",
+    "test:gtk:a11y": "GTK_A11Y=atspi bun run specs/gtk/a11y.spec.ts",
     "test:macos": "bunx wdio run wdio.macos.conf.ts"
   },
   "devDependencies": {

@@ -1,0 +1,17 @@
+{
+  "name": "ghostty-ui-tests",
+  "private": true,
+  "scripts": {
+    "test:gtk": "bun run specs/gtk/terminal.spec.ts",
+    "test:macos": "bunx wdio run wdio.macos.conf.ts"
+  },
+  "devDependencies": {
+    "@wdio/cli": "^9",
+    "@wdio/local-runner": "^9",
+    "@wdio/mocha-framework": "^9",
+    "@wdio/spec-reporter": "^9",
+    "webdriverio": "^9",
+    "typescript": "^5",
+    "ts-node": "^10"
+  }
+}

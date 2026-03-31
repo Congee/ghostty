@@ -1284,6 +1284,22 @@ pub const SplitTree = extern struct {
         return null;
     }
 
+    /// Set a named page in the stack. Removes any existing page
+    /// with that name first.
+    fn setStackPage(self: *Self, name: [:0]const u8, widget: *gtk.Widget) void {
+        const priv = self.private();
+        _ = priv.tab_stack.addNamed(widget, name);
+        priv.tab_stack.setVisibleChildName(name);
+    }
+
+    /// Remove a named page from the stack. Must be called BEFORE
+    /// buildTree (which detaches widgets via initReused).
+    fn removeStackPage(self: *Self, name: [:0]const u8) void {
+        const priv = self.private();
+        const child = priv.tab_stack.getChildByName(name) orelse return;
+        priv.tab_stack.remove(child);
+    }
+
     fn onRebuild(ud: ?*anyopaque) callconv(.c) c_int {
         const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
 
@@ -1299,25 +1315,17 @@ pub const SplitTree = extern struct {
         name_buf[active_name.len] = 0;
         const active_name_z: [:0]const u8 = name_buf[0..active_name.len :0];
 
+        // Remove old page BEFORE buildTree (which detaches reused widgets).
+        self.removeStackPage(active_name_z);
+
         if (self.getCoreTab()) |tab| {
-            if (tab.tree.isEmpty()) {
-                // Remove this tab's page from the stack if it exists.
-                if (priv.tab_stack.getChildByName(active_name_z)) |child| {
-                    priv.tab_stack.remove(child);
-                }
-            } else {
+            if (!tab.tree.isEmpty()) {
                 const built = self.buildTree(
                     &tab.tree,
                     tab.tree.zoomed orelse .root,
                 );
                 defer built.deinit();
-
-                // Replace or add this tab's page in the stack.
-                if (priv.tab_stack.getChildByName(active_name_z)) |old| {
-                    priv.tab_stack.remove(old);
-                }
-                _ = priv.tab_stack.addNamed(built.widget, active_name_z);
-                priv.tab_stack.setVisibleChildName(active_name_z);
+                self.setStackPage(active_name_z, built.widget);
             }
         } else {
             // Fallback: use GTK-owned tree (during init before core has the surface)
@@ -1328,11 +1336,7 @@ pub const SplitTree = extern struct {
                     tree.zoomed orelse .root,
                 );
                 defer built.deinit();
-                if (priv.tab_stack.getChildByName(active_name_z)) |old| {
-                    priv.tab_stack.remove(old);
-                }
-                _ = priv.tab_stack.addNamed(built.widget, active_name_z);
-                priv.tab_stack.setVisibleChildName(active_name_z);
+                self.setStackPage(active_name_z, built.widget);
             }
         }
 

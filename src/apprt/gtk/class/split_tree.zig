@@ -16,7 +16,9 @@ const gresource = @import("../build/gresource.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Application = @import("application.zig").Application;
+const Config = @import("config.zig").Config;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
+const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const Surface = @import("surface.zig").Surface;
 const SurfaceScrolledWindow = @import("surface_scrolled_window.zig").SurfaceScrolledWindow;
 
@@ -136,6 +138,57 @@ pub const SplitTree = extern struct {
                 },
             );
         };
+
+        pub const config = struct {
+            pub const name = "config";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?*Config,
+                .{
+                    .accessor = C.privateObjFieldAccessor("config"),
+                },
+            );
+        };
+
+        pub const title = struct {
+            pub const name = "title";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("title"),
+                },
+            );
+        };
+
+        pub const @"title-override" = struct {
+            pub const name = "title-override";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("title_override"),
+                },
+            );
+        };
+
+        pub const tooltip = struct {
+            pub const name = "tooltip";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("tooltip"),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -148,6 +201,18 @@ pub const SplitTree = extern struct {
                 name,
                 Self,
                 &.{ ?*const Surface.Tree, ?*const Surface.Tree },
+                void,
+            );
+        };
+
+        /// Emitted when the split tree wants to be closed (tree became empty).
+        pub const @"close-request" = struct {
+            pub const name = "close-request";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
                 void,
             );
         };
@@ -176,6 +241,12 @@ pub const SplitTree = extern struct {
         /// Used to store state about a pending surface close for the
         /// close dialog.
         pending_close: ?Surface.Tree.Node.Handle,
+
+        /// Tab title/config (moved from Tab GObject).
+        config: ?*Config = null,
+        title: ?[:0]const u8 = null,
+        title_override: ?[:0]const u8 = null,
+        tooltip: ?[:0]const u8 = null,
 
         pub var offset: c_int = 0;
     };
@@ -945,23 +1016,106 @@ pub const SplitTree = extern struct {
             priv.rebuild_source = null;
         }
 
-        // If core tree is empty, clear immediately (don't defer to idle —
-        // the tab/window may close in response to property notifications
-        // and the idle callback would fire on a dead widget).
+        // If core tree is empty, clear immediately and emit close-request.
         const has_surfaces = if (self.getCoreTab()) |tab| !tab.tree.isEmpty() else false;
         if (!has_surfaces) {
             priv.tree_bin.setChild(null);
-        } else {
-            priv.rebuild_source = glib.idleAdd(onRebuild, self);
+            // Emit close-request so the window closes this tab page.
+            signals.@"close-request".impl.emit(self, null, .{}, null);
+            return;
         }
 
-        // Notify property changes (may trigger tab close if empty).
+        priv.rebuild_source = glib.idleAdd(onRebuild, self);
+
+        // Notify property changes.
         self.as(gobject.Object).freezeNotify();
         defer self.as(gobject.Object).thawNotify();
         self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    /// Tab close action (previously on Tab GObject).
+    fn actionTabClose(
+        _: *gio.SimpleAction,
+        param_: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const param = param_ orelse return;
+        var str: ?[*:0]const u8 = null;
+        param.get("&s", &str);
+        const mode = std.meta.stringToEnum(
+            apprt.action.CloseTabMode,
+            std.mem.span(str orelse return),
+        ) orelse return;
+
+        const core_app = Application.default().core();
+        const idx = core_app.active_tab_index orelse return;
+        const result: CoreApp.CloseTabResult = switch (mode) {
+            .this => core_app.closeTab(idx),
+            .other => core_app.closeOtherTabs(idx),
+            .right => core_app.closeTabsAfter(idx),
+        };
+        switch (result) {
+            .closed => {},
+            .needs_confirm => {
+                // Show confirmation dialog via the window's close-page path
+                const window = ext.getAncestor(
+                    @import("window.zig").Window,
+                    self.as(gtk.Widget),
+                ) orelse return;
+                const tab_view = window.getTabView();
+                const page = tab_view.getPage(self.as(gtk.Widget));
+                tab_view.closePage(page);
+            },
+        }
+    }
+
+    /// Ring bell on unfocused tab page.
+    fn actionRingBell(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const window = ext.getAncestor(
+            @import("window.zig").Window,
+            self.as(gtk.Widget),
+        ) orelse return;
+        const tab_view = window.getTabView();
+        const page = tab_view.getPage(self.as(gtk.Widget));
+        if (page.getSelected() != 0) return;
+        page.setNeedsAttention(@intFromBool(true));
+    }
+
+    /// Prompt user to set a tab title.
+    fn actionPromptTabTitle(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const dialog = TitleDialog.new(.tab, priv.title_override orelse priv.title);
+        _ = TitleDialog.signals.set.connect(
+            dialog,
+            *Self,
+            titleDialogSet,
+            self,
+            .{},
+        );
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn titleDialogSet(
+        _: *TitleDialog,
+        title_ptr: [*:0]const u8,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const title = std.mem.span(title_ptr);
+        if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.title_override = if (title.len == 0) null else glib.ext.dupeZ(u8, title);
+        self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
     }
 
     fn propTree(
@@ -1274,6 +1428,10 @@ pub const SplitTree = extern struct {
                 properties.@"is-zoomed".impl,
                 properties.tree.impl,
                 properties.@"is-split".impl,
+                properties.config.impl,
+                properties.title.impl,
+                properties.@"title-override".impl,
+                properties.tooltip.impl,
             });
 
             // Bindings
@@ -1284,6 +1442,7 @@ pub const SplitTree = extern struct {
 
             // Signals
             signals.changed.impl.register(.{});
+            signals.@"close-request".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);

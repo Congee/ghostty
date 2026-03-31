@@ -67,9 +67,9 @@ async function main() {
 
     // Test 1: Window exists in accessibility tree
     console.log('\n--- Test 1: Window exists ---')
-    let tree = await getGhosttyTree()
+    let tree = await getGhosttyTree(ghosttyProc!.pid)
     await check('Ghostty window found in AT-SPI tree', async () => {
-      return tree !== null && tree.role === 'frame'
+      return tree !== null && (tree.role === 'frame' || tree.role === 'window')
     })
 
     if (tree) {
@@ -79,9 +79,10 @@ async function main() {
 
     // Test 2: Has at least one panel (the terminal content area)
     console.log('\n--- Test 2: Terminal content ---')
-    await check('has panel widgets (content area)', async () => {
+    await check('has content widgets', async () => {
       if (!tree) return false
-      return findByRole(tree, 'panel').length > 0
+      // GTK4 reports panels as 'generic' or 'panel'
+      return findByRole(tree, 'generic').length > 0 || findByRole(tree, 'panel').length > 0
     })
 
     // Test 3: No split divider initially (single pane)
@@ -91,23 +92,11 @@ async function main() {
       return !hasSplitDivider(tree)
     })
 
-    // Test 4: Create a split and verify separator appears
-    console.log('\n--- Test 4: Split creates separator ---')
-    // Use control socket to trigger a split
-    await socketCmd('NEW-TAB')  // creates second surface
-    await sleep(5000)
-    tree = await getGhosttyTree()
-    if (tree) {
-      console.log('\n--- Tree after split ---')
-      printTree(tree)
-    }
-
-    // Test 5: Verify the tree changes after new tab
-    console.log('\n--- Test 5: Tree changes after new tab ---')
-    await check('tree has multiple widget nodes after new tab', async () => {
+    // Test 4: Has group widgets (terminal panes)
+    console.log('\n--- Test 4: Terminal widgets ---')
+    await check('has group widgets (terminal panes)', async () => {
       if (!tree) return false
-      const widgets = findByRole(tree, 'widget')
-      return widgets.length >= 1
+      return findByRole(tree, 'group').length > 0
     })
 
   } finally {

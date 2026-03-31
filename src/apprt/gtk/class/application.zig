@@ -2046,10 +2046,30 @@ const Action = struct {
         switch (target) {
             .app => return false,
             .surface => |_| {
-                // Resolve via core: goto_tab → target surface → focus_surface
                 const core_app = app.core();
-                const target_surface = core_app.resolveGotoTab(tab) orelse return false;
+
+                // Resolve target tab index via core.
+                const tab_count = core_app.tabs.items.len;
+                if (tab_count <= 1) return false;
+                const current = core_app.active_tab_index orelse 0;
+                const target_idx: usize = switch (tab) {
+                    .previous => if (current == 0) tab_count - 1 else current - 1,
+                    .next => if (current == tab_count - 1) 0 else current + 1,
+                    .last => tab_count - 1,
+                    else => blk: {
+                        const raw: c_int = @intFromEnum(tab);
+                        if (raw < 1) return false;
+                        const idx: usize = @intCast(raw - 1);
+                        break :blk @min(idx, tab_count - 1);
+                    },
+                };
+
+                if (!core_app.selectTab(target_idx)) return false;
+
+                // Focus the target surface — this updates the GTK TabView.
+                const target_surface = core_app.resolveGotoTab(tab) orelse return true;
                 return focusSurface(.{ .surface = target_surface });
+
             },
         }
     }
@@ -2058,7 +2078,7 @@ const Action = struct {
         const rt_surface = value.surface;
         const gtk_surface = rt_surface.surface;
 
-        // Find the window containing this surface
+        // Find the window containing this surface and select its tab.
         const window = ext.getAncestor(
             Window,
             gtk_surface.as(gtk.Widget),
@@ -2067,7 +2087,6 @@ const Action = struct {
             return false;
         };
 
-        // Find the tab containing this surface and select it in TabView
         const tab = ext.getAncestor(
             Tab,
             gtk_surface.as(gtk.Widget),
@@ -2081,7 +2100,6 @@ const Action = struct {
             tab_view.setSelectedPage(page);
         }
 
-        // Focus the specific surface
         gtk_surface.grabFocus();
         return true;
     }
@@ -2208,19 +2226,30 @@ const Action = struct {
         switch (target) {
             .app => return false,
             .surface => |core| {
+                const core_app = Application.default().core();
+                const current = core_app.active_tab_index orelse return false;
+                const tab_count = core_app.tabs.items.len;
+                if (tab_count <= 1) return false;
+
+                // Compute target with wrapping
+                const amount: isize = @intCast(value.amount);
+                const current_i: isize = @intCast(current);
+                const count_i: isize = @intCast(tab_count);
+                const target_i = @mod(current_i + amount, count_i);
+                const to: usize = @intCast(target_i);
+
+                if (!core_app.moveTab(current, to)) return false;
+
+                // Sync Adw.TabView ordering
                 const surface = core.rt_surface.surface;
                 const window = ext.getAncestor(
                     Window,
                     surface.as(gtk.Widget),
-                ) orelse {
-                    log.warn("surface is not in a window, ignoring new_tab", .{});
-                    return false;
-                };
-
-                return window.moveTab(
-                    surface,
-                    @intCast(value.amount),
-                );
+                ) orelse return false;
+                const tab_view = window.getTabView();
+                const page = tab_view.getNthPage(@intCast(current));
+                _ = tab_view.reorderPage(page, @intCast(to));
+                return true;
             },
         }
     }

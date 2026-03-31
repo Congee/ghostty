@@ -156,6 +156,10 @@ reattach_on_next_surface: bool = false,
 /// creation (when handling new_split action) and consumed by addSurface.
 pending_split_direction: ?SurfaceSplitTree.Split.Direction = null,
 
+/// The insertion index for the next new tab. Set by the apprt before
+/// surface creation and consumed by addSurface. If null, appends.
+pending_tab_index: ?usize = null,
+
 /// The control socket for external status bar updates and session queries.
 control_socket: ?ControlSocket = null,
 
@@ -382,7 +386,9 @@ pub fn addSurface(
             }
         },
         .tab, .window => {
-            try self.createTab(rt_surface);
+            const idx = self.pending_tab_index;
+            self.pending_tab_index = null;
+            try self.createTabAt(rt_surface, idx);
         },
     }
 
@@ -398,15 +404,43 @@ pub fn addSurface(
     };
 }
 
+pub const NewTabPosition = enum { current, end };
+
+/// Compute where a new tab should be inserted based on position policy.
+pub fn resolveNewTabIndex(self: *const App, position: NewTabPosition) usize {
+    return switch (position) {
+        .current => if (self.active_tab_index) |idx|
+            @min(idx + 1, self.tabs.items.len)
+        else
+            self.tabs.items.len,
+        .end => self.tabs.items.len,
+    };
+}
+
 /// Create a new tab containing the given surface as a single-leaf tree.
+/// Inserts at the given index (or appends if null). Returns the tab index.
 fn createTab(self: *App, rt_surface: *apprt.Surface) Allocator.Error!void {
+    return self.createTabAt(rt_surface, null);
+}
+
+fn createTabAt(self: *App, rt_surface: *apprt.Surface, index: ?usize) Allocator.Error!void {
     var view: SurfaceView = .{ .surface = rt_surface };
     var tree = try SurfaceSplitTree.init(self.alloc, &view);
     errdefer tree.deinit();
-    try self.tabs.append(self.alloc, .{
+    const tab: Tab = .{
         .id = self.next_tab_id,
         .tree = tree,
-    });
+    };
+    if (index) |idx| {
+        const clamped = @min(idx, self.tabs.items.len);
+        try self.tabs.insert(self.alloc, clamped, tab);
+        // Adjust active_tab_index if inserting before it
+        if (self.active_tab_index) |active| {
+            if (clamped <= active) self.active_tab_index = active + 1;
+        }
+    } else {
+        try self.tabs.append(self.alloc, tab);
+    }
     self.next_tab_id += 1;
 }
 
@@ -689,6 +723,49 @@ pub fn closeTab(self: *App, index: usize) CloseTabResult {
     }
     for (surfaces_buf[0..count]) |rt_surface| {
         rt_surface.core().close();
+    }
+    return .closed;
+}
+
+/// Close all tabs except the one at the given index.
+/// Returns `.needs_confirm` if any surface requires confirmation.
+pub fn closeOtherTabs(self: *App, except: usize) CloseTabResult {
+    if (except >= self.tabs.items.len) return .closed;
+
+    // Check if any tab (except the kept one) needs confirmation.
+    for (self.tabs.items, 0..) |*tab, i| {
+        if (i == except) continue;
+        var it = tab.surfaceIterator();
+        while (it.next()) |rt_surface| {
+            if (rt_surface.core().needsConfirmQuit()) return .needs_confirm;
+        }
+    }
+
+    // Close tabs from the end to avoid index shifting.
+    var i: usize = self.tabs.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (i == except) continue;
+        _ = self.closeTab(i);
+    }
+    return .closed;
+}
+
+/// Close all tabs after (to the right of) the given index.
+pub fn closeTabsAfter(self: *App, after: usize) CloseTabResult {
+    if (after >= self.tabs.items.len) return .closed;
+
+    for (self.tabs.items[after + 1 ..]) |*tab| {
+        var it = tab.surfaceIterator();
+        while (it.next()) |rt_surface| {
+            if (rt_surface.core().needsConfirmQuit()) return .needs_confirm;
+        }
+    }
+
+    var i: usize = self.tabs.items.len;
+    while (i > after + 1) {
+        i -= 1;
+        _ = self.closeTab(i);
     }
     return .closed;
 }

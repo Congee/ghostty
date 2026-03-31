@@ -13,6 +13,7 @@ const apprt = @import("../../../apprt.zig");
 const configpkg = @import("../../../config.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
 const input = @import("../../../input.zig");
+const CoreApp = @import("../../../App.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gtk_version = @import("../gtk_version.zig");
@@ -446,22 +447,16 @@ pub const Window = extern struct {
             tab.setParentWithContext(p, context);
         }
 
-        // Get the position that we should insert the new tab at.
-        const config = if (priv.config) |v| v.get() else {
-            // If we don't have a config we just append it at the end.
-            // This should never happen.
-            return tab_view.append(tab.as(gtk.Widget));
-        };
-        const position = switch (config.@"window-new-tab-position") {
-            .current => current: {
-                const selected = tab_view.getSelectedPage() orelse
-                    break :current tab_view.getNPages();
-                const current = tab_view.getPagePosition(selected);
-                break :current current + 1;
-            },
-
-            .end => tab_view.getNPages(),
-        };
+        // Compute tab insertion position via core.
+        const core_app = Application.default().core();
+        const config = if (priv.config) |v| v.get() else null;
+        const pos_policy: CoreApp.NewTabPosition = if (config) |c|
+            if (c.@"window-new-tab-position" == .current) .current else .end
+        else
+            .end;
+        const position: c_int = @intCast(core_app.resolveNewTabIndex(pos_policy));
+        // Set pending_tab_index so core's addSurface inserts at the same position.
+        core_app.pending_tab_index = @intCast(position);
 
         // Add the page and select it
         const page = tab_view.insert(tab.as(gtk.Widget), position);
@@ -495,104 +490,6 @@ pub const Window = extern struct {
         self.connectSurfaceHandlersFromSplitTree(split_tree);
 
         return page;
-    }
-
-    pub const SelectTab = union(enum) {
-        previous,
-        next,
-        last,
-        n: usize,
-    };
-
-    /// Select the tab as requested. Returns true if the tab selection
-    /// changed.
-    pub fn selectTab(self: *Self, n: SelectTab) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
-
-        // Get our current tab numeric position
-        const selected = tab_view.getSelectedPage() orelse return false;
-        const current = tab_view.getPagePosition(selected);
-
-        // Get our total
-        const total = tab_view.getNPages();
-
-        const goto: c_int = switch (n) {
-            .previous => if (current > 0)
-                current - 1
-            else
-                total - 1,
-
-            .next => if (current < total - 1)
-                current + 1
-            else
-                0,
-
-            .last => total - 1,
-
-            .n => |v| n: {
-                // 1-indexed
-                if (v == 0) return false;
-
-                const n_int = std.math.cast(
-                    c_int,
-                    v,
-                ) orelse return false;
-                break :n @min(n_int - 1, total - 1);
-            },
-        };
-        assert(goto >= 0);
-        assert(goto < total);
-
-        // If our target is the same as our current then we do nothing.
-        if (goto == current) return false;
-
-        // Add the page and select it
-        const page = tab_view.getNthPage(goto);
-        tab_view.setSelectedPage(page);
-
-        return true;
-    }
-
-    /// Move the tab containing the given surface by the given amount.
-    /// Returns if this affected any tab positioning.
-    pub fn moveTab(
-        self: *Self,
-        surface: *Surface,
-        amount: isize,
-    ) bool {
-        const priv = self.private();
-        const tab_view = priv.tab_view;
-
-        // If we have one tab we never move.
-        const total = tab_view.getNPages();
-        if (total == 1) return false;
-
-        // Get the tab that contains the given surface.
-        const tab = ext.getAncestor(
-            Tab,
-            surface.as(gtk.Widget),
-        ) orelse return false;
-
-        // Get the page position that contains the tab.
-        const page = tab_view.getPage(tab.as(gtk.Widget));
-        const pos = tab_view.getPagePosition(page);
-
-        // Move it
-        const desired_pos: c_int = desired: {
-            const initial: c_int = @intCast(pos + amount);
-            const max = total - 1;
-            break :desired if (initial < 0)
-                max + initial + 1
-            else if (initial > max)
-                initial - max - 1
-            else
-                initial;
-        };
-        assert(desired_pos >= 0);
-        assert(desired_pos < total);
-
-        return tab_view.reorderPage(page, desired_pos) != 0;
     }
 
     pub fn toggleTabOverview(self: *Self) void {

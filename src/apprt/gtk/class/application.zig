@@ -1913,26 +1913,18 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const core_app = Application.default().core();
+                const idx = core_app.active_tab_index orelse return false;
 
-                switch (value) {
-                    .this => {
-                        const idx = core_app.active_tab_index orelse return false;
-                        const result = core_app.closeTab(idx);
-                        switch (result) {
-                            .closed => return true,
-                            .needs_confirm => {
-                                // Fall through to GTK confirmation dialog
-                                const surface = core.rt_surface.surface;
-                                return surface.as(gtk.Widget).activateAction(
-                                    "tab.close",
-                                    glib.ext.VariantType.stringFor([:0]const u8),
-                                    @as([*:0]const u8, @tagName(value)),
-                                ) != 0;
-                            },
-                        }
-                    },
-                    // other/right modes still use GTK path for now
-                    .other, .right => {
+                const result: CoreApp.CloseTabResult = switch (value) {
+                    .this => core_app.closeTab(idx),
+                    .other => core_app.closeOtherTabs(idx),
+                    .right => core_app.closeTabsAfter(idx),
+                };
+
+                switch (result) {
+                    .closed => return true,
+                    .needs_confirm => {
+                        // Fall through to GTK confirmation dialog
                         const surface = core.rt_surface.surface;
                         return surface.as(gtk.Widget).activateAction(
                             "tab.close",

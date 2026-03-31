@@ -455,24 +455,40 @@ pub const Tab = extern struct {
         page.setNeedsAttention(@intFromBool(true));
     }
 
-    /// Select the next tab page.
+    /// Select the next tab page via core, then update GTK.
     fn actionNextPage(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
+        const core_app = Application.default().core();
+        const tab_count = core_app.tabs.items.len;
+        if (tab_count <= 1) return;
+        const current = core_app.active_tab_index orelse 0;
+        const next = if (current >= tab_count - 1) 0 else current + 1;
+        _ = core_app.selectTab(next);
+        // Sync GTK TabView selection
         const tab_view = self.getTabView() orelse return;
-        _ = tab_view.selectNextPage();
+        const page = tab_view.getNthPage(@intCast(next));
+        tab_view.setSelectedPage(page);
     }
 
-    /// Select the previous tab page.
+    /// Select the previous tab page via core, then update GTK.
     fn actionPreviousPage(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
+        const core_app = Application.default().core();
+        const tab_count = core_app.tabs.items.len;
+        if (tab_count <= 1) return;
+        const current = core_app.active_tab_index orelse 0;
+        const prev = if (current == 0) tab_count - 1 else current - 1;
+        _ = core_app.selectTab(prev);
+        // Sync GTK TabView selection
         const tab_view = self.getTabView() orelse return;
-        _ = tab_view.selectPreviousPage();
+        const page = tab_view.getNthPage(@intCast(prev));
+        tab_view.setSelectedPage(page);
     }
 
     fn closureComputedTitle(

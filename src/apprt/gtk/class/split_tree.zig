@@ -1008,7 +1008,7 @@ pub const SplitTree = extern struct {
 
     /// Trigger a widget rebuild from core tree state. Used after core
     /// mutations (equalize, zoom, resize, etc.) to update the GTK widgets.
-    fn triggerRebuild(self: *Self) void {
+    pub fn triggerRebuild(self: *Self) void {
         const priv = self.private();
 
         // Disconnect old handlers, reconnect after rebuild
@@ -1039,6 +1039,12 @@ pub const SplitTree = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    /// Clear the cached core tab ID so getCoreTab re-bootstraps
+    /// to the current active tab. Called when switching tabs.
+    pub fn clearCoreTabId(self: *Self) void {
+        self.private().core_tab_id = null;
     }
 
     /// Set the configuration for this split tree.

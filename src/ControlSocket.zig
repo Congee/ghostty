@@ -287,6 +287,48 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         return "OK\n";
     }
 
+    // Tab management commands. These go through core App methods
+    // and trigger the apprt to sync its UI.
+    if (std.mem.startsWith(u8, line, "NEW-TAB")) {
+        const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+        _ = surface.rt_surface.rtApp().performAction(
+            .{ .surface = surface },
+            .new_tab,
+            {},
+        ) catch return "ERR action failed\n";
+        return "OK\n";
+    }
+
+    if (std.mem.startsWith(u8, line, "CLOSE-TAB")) {
+        const idx = self.app.active_tab_index orelse return "ERR no active tab\n";
+        const result = self.app.closeTab(idx);
+        return switch (result) {
+            .closed => "OK\n",
+            .needs_confirm => "ERR needs confirmation\n",
+        };
+    }
+
+    if (std.mem.startsWith(u8, line, "GOTO-TAB ")) {
+        const arg = std.mem.trim(u8, line["GOTO-TAB ".len..], " \t\r\n");
+        if (std.mem.eql(u8, arg, "next")) {
+            const count = self.app.tabs.items.len;
+            if (count <= 1) return "ERR only one tab\n";
+            const current = self.app.active_tab_index orelse 0;
+            _ = self.app.selectTab(if (current >= count - 1) 0 else current + 1);
+            return "OK\n";
+        } else if (std.mem.eql(u8, arg, "previous")) {
+            const count = self.app.tabs.items.len;
+            if (count <= 1) return "ERR only one tab\n";
+            const current = self.app.active_tab_index orelse 0;
+            _ = self.app.selectTab(if (current == 0) count - 1 else current - 1);
+            return "OK\n";
+        } else {
+            const idx = std.fmt.parseInt(usize, arg, 10) catch return "ERR invalid index\n";
+            if (!self.app.selectTab(idx)) return "ERR invalid index\n";
+            return "OK\n";
+        }
+    }
+
     return "ERR unknown command\n";
 }
 

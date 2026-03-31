@@ -2080,9 +2080,18 @@ const Action = struct {
 
                 if (!core_app.selectTab(target_idx)) return false;
 
-                // Focus the target surface — this updates the GTK TabView.
-                const target_surface = core_app.resolveGotoTab(tab) orelse return true;
-                return focusSurface(.{ .surface = target_surface });
+                // Switch the window's SplitTree to the new active tab.
+                // Use the app's active window since the target surface
+                // may not be in the widget tree yet.
+                const active_win = gtk.Application.getActiveWindow(
+                    app.as(gtk.Application),
+                );
+                if (active_win) |win| {
+                    if (gobject.ext.cast(Window, win)) |window| {
+                        window.switchTab();
+                    }
+                }
+                return true;
 
             },
         }

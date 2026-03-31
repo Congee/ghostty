@@ -710,8 +710,7 @@ pub fn closeTab(self: *App, index: usize) CloseTabResult {
         if (rt_surface.core().needsConfirmQuit()) return .needs_confirm;
     }
 
-    // Close all surfaces. deleteSurface handles tree removal and
-    // auto-removes the empty tab.
+    // Remove all surfaces via deleteSurface (avoids close-request recursion).
     var surfaces_buf: [64]*apprt.Surface = undefined;
     var count: usize = 0;
     var it2 = tab.surfaceIterator();
@@ -722,7 +721,7 @@ pub fn closeTab(self: *App, index: usize) CloseTabResult {
         }
     }
     for (surfaces_buf[0..count]) |rt_surface| {
-        rt_surface.core().close();
+        self.deleteSurface(rt_surface);
     }
     return .closed;
 }

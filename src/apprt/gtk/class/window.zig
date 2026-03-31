@@ -375,14 +375,58 @@ pub const Window = extern struct {
         return &self.private().winproto;
     }
 
-    /// Create a new tab in this window. Since we now have a single SplitTree,
-    /// "new tab" creates a new surface via the core and adds it to the split tree.
+    /// Create a new tab. Creates a surface with .tab context so core's
+    /// addSurface creates a new core tab. Then rebuilds the SplitTree
+    /// to display the new tab.
     pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
         const priv = self.private();
-        const gtk_parent: ?*Surface = if (parent_) |p| p.rt_surface.surface else null;
-        priv.split_tree.newSplit(.right, gtk_parent, .{}) catch |err| switch (err) {
-            error.OutOfMemory => @panic("oom"),
-        };
+        const core_app = Application.default().core();
+
+        // Compute insertion position
+        const config = if (priv.config) |v| v.get() else null;
+        const pos_policy: CoreApp.NewTabPosition = if (config) |c|
+            if (c.@"window-new-tab-position" == .current) .current else .end
+        else
+            .end;
+        core_app.pending_tab_index = core_app.resolveNewTabIndex(pos_policy);
+
+        // Create a new surface with .tab context (not .split).
+        const surface: *Surface = .new(.{});
+        defer surface.unref();
+        _ = surface.refSink();
+
+        if (parent_) |p| {
+            surface.setParent(p, .tab);
+        }
+
+        // Bind is-split property
+        _ = priv.split_tree.as(gobject.Object).bindProperty(
+            "is-split",
+            surface.as(gobject.Object),
+            "is-split",
+            .{ .sync_create = true },
+        );
+
+        // Set this surface into the SplitTree via setTree (creates a single-node GTK tree).
+        // When the surface initializes, addSurface runs with .tab context → core creates new tab.
+        const alloc = Application.default().allocator();
+        var single_tree = Surface.Tree.init(alloc, surface) catch return;
+        defer single_tree.deinit();
+
+        // Clear core_tab_id so getCoreTab re-bootstraps to the new active tab
+        // after the surface init triggers addSurface.
+        priv.split_tree.clearCoreTabId();
+        priv.split_tree.setTree(&single_tree);
+    }
+
+    /// Switch the SplitTree to display the current active core tab.
+    /// Called after core.selectTab() to refresh the display.
+    pub fn switchTab(self: *Self) void {
+        const priv = self.private();
+        // Clear cached tab ID so SplitTree reads from the new active tab.
+        priv.split_tree.clearCoreTabId();
+        // Trigger rebuild from the new core tab's tree.
+        priv.split_tree.triggerRebuild();
     }
 
     pub fn newTabForWindow(

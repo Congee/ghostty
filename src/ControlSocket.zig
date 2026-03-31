@@ -193,17 +193,29 @@ fn handleConnection(self: *ControlSocket, conn: posix.socket_t) bool {
             return true; // Keep connection open
         }
 
+        // Parse optional @id suffix for async request matching.
+        var command = line;
+        var request_id: ?[]const u8 = null;
+        if (std.mem.lastIndexOf(u8, line, " @")) |at_pos| {
+            request_id = line[at_pos + 2 ..];
+            command = std.mem.trimRight(u8, line[0..at_pos], " ");
+        }
+
         var resp_buf: [8192]u8 = undefined;
-        const response = self.handleCommand(line, &resp_buf) catch |err| {
+        const response = self.handleCommand(command, &resp_buf) catch |err| {
             const msg = std.fmt.bufPrint(&buf, "ERR {}\n", .{err}) catch return false;
             _ = posix.write(conn, msg) catch {};
             continue;
         };
 
-        log.warn("handleConnection: responding with {d} bytes fd={}", .{ response.len, conn });
-        _ = posix.write(conn, response) catch |err| {
-            log.warn("handleConnection: write error fd={} err={}", .{ conn, err });
-        };
+        // Prepend @id to response if present.
+        if (request_id) |id| {
+            var id_buf: [8192 + 64]u8 = undefined;
+            const prefixed = std.fmt.bufPrint(&id_buf, "@{s} {s}", .{ id, response }) catch response;
+            _ = posix.write(conn, prefixed) catch {};
+        } else {
+            _ = posix.write(conn, response) catch {};
+        }
     }
     return false;
 }
@@ -243,6 +255,10 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
 
     if (std.mem.startsWith(u8, line, "LIST-TABS")) {
         return self.listTabs(resp_buf);
+    }
+
+    if (std.mem.startsWith(u8, line, "GET-TEXT")) {
+        return self.getText(line, resp_buf);
     }
 
     if (std.mem.startsWith(u8, line, "GET-STATUS-BAR")) {
@@ -444,6 +460,25 @@ fn getFocused(self: *ControlSocket, buf: []u8) []const u8 {
     std.fmt.format(w, ",\"tabs\":{d}}}\n", .{
         tab_count,
     }) catch return "ERR buffer overflow\n";
+    return fbs.getWritten();
+}
+
+/// GET-TEXT: returns the visible terminal screen content as plain text.
+fn getText(self: *ControlSocket, _: []const u8, resp_buf: []u8) []const u8 {
+    const surface = self.surface_fn(self.app) orelse return "ERR no focused surface\n";
+
+    // Lock the renderer state to safely read the terminal.
+    surface.renderer_state.mutex.lock();
+    defer surface.renderer_state.mutex.unlock();
+
+    const term = surface.renderer_state.terminal;
+    const text = term.plainString(self.alloc) catch return "ERR alloc\n";
+    defer self.alloc.free(text);
+
+    var fbs = std.io.fixedBufferStream(resp_buf);
+    const w = fbs.writer();
+    w.writeAll(text) catch return "ERR buffer overflow\n";
+    w.writeByte('\n') catch return "ERR buffer overflow\n";
     return fbs.getWritten();
 }
 

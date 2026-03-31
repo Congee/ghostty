@@ -23,6 +23,7 @@ const new_window = @import("new_window.zig");
 const daemon_cmd = @import("daemon.zig");
 const session_cmd = @import("session.zig");
 const connect_cmd = @import("connect.zig");
+const cmd_action = @import("cmd.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
 /// invoked by using `+<action>` as a CLI flag. The only exception is
@@ -84,6 +85,9 @@ pub const Action = enum {
 
     /// Connect to a remote daemon (TCP or Unix socket)
     connect,
+
+    /// Send commands to a running Ghostty instance via control socket
+    cmd,
 
     pub fn detectSpecialCase(arg: []const u8) ?SpecialCase(Action) {
         // If we see a "-e" and we haven't seen a command yet, then
@@ -167,6 +171,7 @@ pub const Action = enum {
             .daemon => try daemon_cmd.run(alloc),
             .session => try session_cmd.run(alloc),
             .connect => try connect_cmd.run(alloc),
+            .cmd => try cmd_action.run(alloc),
         };
     }
 
@@ -210,6 +215,7 @@ pub const Action = enum {
                 .daemon => daemon_cmd.Options,
                 .session => session_cmd.Options,
                 .connect => connect_cmd.Options,
+                .cmd => cmd_action.Options,
             };
         }
     }

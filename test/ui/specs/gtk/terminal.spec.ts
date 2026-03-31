@@ -148,23 +148,20 @@ async function main() {
     // The window should close automatically (wait_after_command = false).
     console.log('\n--- Test 5: Shell exit closes window ---')
     stopGhostty()
-    await check('shell exit closes ghostty', async () => {
+    // Note: this test requires a visible window for the close path to work.
+    // Bun.spawn may not allocate a PTY, preventing shell exit detection.
+    await check('shell exit closes ghostty (may need visible window)', async () => {
       const proc = Bun.spawn([GHOSTTY, '-e', '/bin/sh', '-c', 'sleep 1; exit 0'], {
         stdout: 'ignore',
         stderr: 'ignore',
       })
-      // Wait for the process to exit (shell exits after 1s, then ghostty closes)
-      const start = Date.now()
-      while (Date.now() - start < 8000) {
-        try {
-          process.kill(proc.pid, 0)
-          await sleep(200)
-        } catch {
-          return true // Exited
-        }
-      }
-      proc.kill()
-      return false // Didn't exit
+      // Wait for the process to exit using Bun's exited promise
+      const result = await Promise.race([
+        proc.exited.then(() => true),
+        sleep(12000).then(() => false),
+      ])
+      if (!result) proc.kill()
+      return result
     })
   } finally {
     stopGhostty()

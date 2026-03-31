@@ -1050,14 +1050,14 @@ pub const SplitTree = extern struct {
     pub fn addNewTab(self: *Self, parent_: ?*Surface) void {
         const priv = self.private();
 
-        // Create new surface.
+        // Create new surface with .tab context so addSurface creates a new core tab.
         const surface: *Surface = .new(.{});
         defer surface.unref();
         _ = surface.refSink();
 
         if (parent_) |p| {
             if (p.core()) |core| {
-                surface.setParent(core, .split);
+                surface.setParent(core, .tab);
             }
         }
 
@@ -1079,13 +1079,18 @@ pub const SplitTree = extern struct {
         );
 
         // Create a SurfaceScrolledWindow and add as a new stack page.
-        // Use a temporary name — it will be renamed after core assigns a tab.
         const scrolled = gobject.ext.newInstance(
             SurfaceScrolledWindow,
             .{ .surface = surface },
         );
-        _ = priv.tab_stack.addNamed(scrolled.as(gtk.Widget), "new-tab");
-        priv.tab_stack.setVisibleChildName("new-tab");
+        // Use a unique name based on the next tab count to avoid collisions.
+        const core_app = Application.default().core();
+        var new_name_buf: [32:0]u8 = std.mem.zeroes([32:0]u8);
+        const new_name = std.fmt.bufPrint(&new_name_buf, "new-{d}", .{core_app.next_tab_id}) catch "new-0";
+        new_name_buf[new_name.len] = 0;
+        const new_name_z: [:0]const u8 = new_name_buf[0..new_name.len :0];
+        _ = priv.tab_stack.addNamed(scrolled.as(gtk.Widget), new_name_z);
+        priv.tab_stack.setVisibleChildName(new_name_z);
 
         // Update last_focused.
         priv.last_focused.set(surface);

@@ -597,8 +597,6 @@ pub fn focusSurface(self: *App, surface: *Surface) void {
     if (!self.hasSurface(surface)) return;
     const changed = self.focused_surface != surface;
     self.focused_surface = surface;
-    // Keep active_tab_index in sync.
-    self.active_tab_index = self.tabIndexForSurface(surface);
     // Update status bar so the active tab marker (*) moves immediately.
     if (changed) self.sendTabsUpdate();
 }
@@ -720,7 +718,8 @@ pub fn closeTab(self: *App, index: usize) CloseTabResult {
     // Check if any surface needs confirmation.
     var it = tab.surfaceIterator();
     while (it.next()) |rt_surface| {
-        if (rt_surface.core().needsConfirmQuit()) return .needs_confirm;
+        const cs = rt_surface.surface.core() orelse continue;
+        if (cs.needsConfirmQuit()) return .needs_confirm;
     }
 
     // Remove all surfaces via deleteSurface (avoids close-request recursion).

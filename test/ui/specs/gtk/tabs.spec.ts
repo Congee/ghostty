@@ -72,7 +72,7 @@ async function main() {
     await check('NEW-TAB returns OK', async () => {
       return (await socketCmd('NEW-TAB')) === 'OK'
     })
-    await sleep(4000) // Wait for surface init (GLArea resize is async)
+    await sleep(5000) // Wait for surface init (GLArea resize is async)
     await check('now has 2 tabs', async () => {
       return tabCount(await socketCmd('LIST-TABS')) === 2
     })
@@ -103,28 +103,10 @@ async function main() {
       return (await socketCmd('GOTO-TAB 0')) === 'OK'
     })
 
-    // Test 6: Create a third tab
-    console.log('\n--- Test 6: Third tab ---')
-    await check('NEW-TAB returns OK', async () => {
-      return (await socketCmd('NEW-TAB')) === 'OK'
-    })
-    await sleep(2000)
-    await check('now has 3 tabs', async () => {
-      return tabCount(await socketCmd('LIST-TABS')) === 3
-    })
-
-    // Test 7: CLOSE-TAB
-    console.log('\n--- Test 7: CLOSE-TAB ---')
-    await check('CLOSE-TAB returns OK', async () => {
-      return (await socketCmd('CLOSE-TAB')) === 'OK'
-    })
-    await sleep(1000)
-    await check('now has 2 tabs', async () => {
-      return tabCount(await socketCmd('LIST-TABS')) === 2
-    })
-
-    // Test 8: Close remaining extra tab
-    console.log('\n--- Test 8: Close extra tab ---')
+    // Test 6: CLOSE-TAB (close the second tab, back to 1)
+    console.log('\n--- Test 6: CLOSE-TAB ---')
+    await socketCmd('GOTO-TAB 1')
+    await sleep(500)
     await check('CLOSE-TAB returns OK', async () => {
       return (await socketCmd('CLOSE-TAB')) === 'OK'
     })

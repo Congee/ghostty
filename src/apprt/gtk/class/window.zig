@@ -389,8 +389,6 @@ pub const Window = extern struct {
         else
             .end;
         core_app.pending_tab_index = core_app.resolveNewTabIndex(pos_policy);
-        core_app.pending_new_tab = true;
-
         priv.split_tree.addNewTab(if (parent_) |p| p.rt_surface.surface else null);
     }
 

@@ -324,7 +324,8 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
             return "OK\n";
         } else {
             const idx = std.fmt.parseInt(usize, arg, 10) catch return "ERR invalid index\n";
-            if (!self.app.selectTab(idx)) return "ERR invalid index\n";
+            if (idx >= self.app.tabs.items.len) return "ERR invalid index\n";
+            _ = self.app.selectTab(idx); // OK even if already at this index
             return "OK\n";
         }
     }
@@ -396,7 +397,7 @@ fn wakeRenderers(self: *ControlSocket) void {
 /// LIST-TABS: returns JSON array of tab info.
 /// Format: [{"index":0,"title":"zsh","active":true}, ...]
 fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
-    const focused = self.surface_fn(self.app);
+    const active_idx = self.app.active_tab_index;
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeByte('[') catch return "ERR buffer overflow\n";
@@ -405,7 +406,7 @@ fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
     for (self.app.tabs.items) |tab| {
         const core = tab.representativeSurface() orelse continue;
         const label = core.session.displayLabel();
-        const is_active = if (focused) |f| tab.containsSurface(f) else false;
+        const is_active = if (active_idx) |ai| ai == tab_idx else tab_idx == 0;
 
         if (tab_idx > 0) w.writeByte(',') catch return "ERR buffer overflow\n";
         std.fmt.format(w, "{{\"index\":{d},\"title\":", .{tab_idx}) catch return "ERR buffer overflow\n";

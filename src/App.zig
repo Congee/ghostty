@@ -616,6 +616,14 @@ fn tabForRtSurface(self: *App, rt_surface: *apprt.Surface) ?*Tab {
     return null;
 }
 
+/// Find a tab by its unique ID.
+pub fn tabForId(self: *App, id: u32) ?*Tab {
+    for (self.tabs.items) |*tab| {
+        if (tab.id == id) return tab;
+    }
+    return null;
+}
+
 fn redrawSurface(
     self: *App,
     rt_app: *apprt.App,

@@ -160,6 +160,11 @@ pub const SplitTree = extern struct {
         // Template bindings
         tree_bin: *adw.Bin,
 
+        /// The core tab ID this split tree belongs to. Set when the first
+        /// surface is added and used by getCoreTab to find the tab without
+        /// depending on focused_surface.
+        core_tab_id: ?u32 = null,
+
         /// Last focused surface in the tree. We need this to handle various
         /// tree change states.
         last_focused: WeakRef(Surface) = .empty,
@@ -519,20 +524,10 @@ pub const SplitTree = extern struct {
     /// Returns true if this split tree needs confirmation before quitting based
     /// on the various Ghostty configurations.
     pub fn getNeedsConfirmQuit(self: *Self) bool {
-        if (self.getCoreTab()) |tab| {
-            var it = tab.surfaceIterator();
-            while (it.next()) |rt_surface| {
-                if (rt_surface.core().needsConfirmQuit()) return true;
-            }
-            return false;
-        }
-        // Legacy fallback
-        const tree = self.getTree() orelse return false;
-        var it = tree.iterator();
-        while (it.next()) |entry| {
-            if (entry.view.core()) |core| {
-                if (core.needsConfirmQuit()) return true;
-            }
+        const tab = self.getCoreTab() orelse return false;
+        var it = tab.surfaceIterator();
+        while (it.next()) |rt_surface| {
+            if (rt_surface.core().needsConfirmQuit()) return true;
         }
         return false;
     }
@@ -591,8 +586,10 @@ pub const SplitTree = extern struct {
 
     pub fn getHasSurfaces(self: *Self) bool {
         if (self.getCoreTab()) |tab| return !tab.tree.isEmpty();
-        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
-        return !tree.isEmpty();
+        // No core tab found. If we have a stored tab ID, the tab was deleted
+        // (last surface closed) — return false so the tab widget closes.
+        // Otherwise we're still initializing — return true to keep alive.
+        return self.private().core_tab_id == null;
     }
 
     pub fn getIsZoomed(self: *Self) bool {
@@ -860,49 +857,50 @@ pub const SplitTree = extern struct {
         priv.pending_close = null;
         const alloc = Application.default().allocator();
 
-        // Find the surface and next focus target. Prefer core tree.
-        var closing_core: ?*CoreSurface = null;
-        var next_focus: ?*Surface = null;
-
-        if (self.getCoreTab()) |tab| {
-            closing_core = tab.tree.nodes[coreHandle(handle).idx()].leaf.surface.core();
-
-            // Find next focus target in core tree
-            const ch = coreHandle(handle);
-            const next_handle: CoreApp.SurfaceSplitTree.Node.Handle =
-                (tab.tree.goto(alloc, ch, .previous) catch null) orelse
-                (tab.tree.goto(alloc, ch, .next) catch null) orelse
-                ch;
-            if (next_handle != ch) {
-                next_focus = tab.tree.nodes[next_handle.idx()].leaf.surface.surface;
+        // Find next focus target before removal.
+        const next_focus: ?*Surface = next_focus: {
+            if (self.getCoreTab()) |tab| {
+                const ch = coreHandle(handle);
+                const next_handle: CoreApp.SurfaceSplitTree.Node.Handle =
+                    (tab.tree.goto(alloc, ch, .previous) catch null) orelse
+                    (tab.tree.goto(alloc, ch, .next) catch null) orelse
+                    ch;
+                if (next_handle != ch) {
+                    break :next_focus tab.tree.nodes[next_handle.idx()].leaf.surface.surface;
+                }
+            } else {
+                const old_tree = self.getTree() orelse break :next_focus null;
+                const next_h: Surface.Tree.Node.Handle =
+                    (old_tree.goto(alloc, handle, .previous) catch null) orelse
+                    (old_tree.goto(alloc, handle, .next) catch null) orelse
+                    handle;
+                if (next_h != handle) {
+                    break :next_focus old_tree.nodes[next_h.idx()].leaf;
+                }
             }
-        } else {
+            break :next_focus null;
+        };
+
+        // Find the closing surface from core tree.
+        const closing_rt = if (self.getCoreTab()) |tab|
+            tab.tree.nodes[coreHandle(handle).idx()].leaf.surface
+        else rt: {
             // Legacy fallback
             const old_tree = self.getTree() orelse return;
-            if (old_tree.nodes[handle.idx()] == .leaf) {
-                const leaf_surface = old_tree.nodes[handle.idx()].leaf;
-                closing_core = leaf_surface.core();
-            }
-            const next_h: Surface.Tree.Node.Handle =
-                (old_tree.goto(alloc, handle, .previous) catch null) orelse
-                (old_tree.goto(alloc, handle, .next) catch null) orelse
-                handle;
-            if (next_h != handle) {
-                next_focus = old_tree.nodes[next_h.idx()].leaf;
-            }
-        }
+            const gtk_surface = old_tree.nodes[handle.idx()].leaf;
+            const core = gtk_surface.core() orelse return;
+            break :rt core.rt_surface;
+        };
 
-        // Close the surface via core.
-        if (closing_core) |core| core.close();
+        // Remove from core tree. This removes the surface from the tab
+        // and removes empty tabs.
+        Application.default().core().deleteSurface(closing_rt);
 
-        // Trigger widget rebuild from core tree.
+        // Rebuild widgets from the (now updated) core tree.
         self.triggerRebuild();
 
         // Grab focus on the next surface.
-        if (next_focus) |v| {
-            priv.last_focused.set(v);
-            v.grabFocus();
-        }
+        if (next_focus) |v| priv.last_focused.set(v);
     }
 
     /// Called when a new surface completes initialization (after core addSurface).
@@ -939,22 +937,31 @@ pub const SplitTree = extern struct {
         self.disconnectSurfaceHandlers();
         self.connectSurfaceHandlers();
 
-        // Notify property changes
-        self.as(gobject.Object).freezeNotify();
-        defer self.as(gobject.Object).thawNotify();
-        self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
-        self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
-        self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
-        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
-
-        // Schedule rebuild if not already scheduled
+        // Cancel any pending rebuild
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove rebuild source", .{});
             }
             priv.rebuild_source = null;
         }
-        priv.rebuild_source = glib.idleAdd(onRebuild, self);
+
+        // If core tree is empty, clear immediately (don't defer to idle —
+        // the tab/window may close in response to property notifications
+        // and the idle callback would fire on a dead widget).
+        const has_surfaces = if (self.getCoreTab()) |tab| !tab.tree.isEmpty() else false;
+        if (!has_surfaces) {
+            priv.tree_bin.setChild(null);
+        } else {
+            priv.rebuild_source = glib.idleAdd(onRebuild, self);
+        }
+
+        // Notify property changes (may trigger tab close if empty).
+        self.as(gobject.Object).freezeNotify();
+        defer self.as(gobject.Object).thawNotify();
+        self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
     fn propTree(
@@ -997,20 +1004,31 @@ pub const SplitTree = extern struct {
         );
     }
 
-    /// Find the core App.Tab for this split tree by looking up any surface
-    /// in the current GTK tree through the core App's tab list.
-    /// NOTE: Must not call getActiveSurface (which calls getCoreTab → infinite recursion).
+    /// Find the core App.Tab for this split tree.
     pub fn getCoreTab(self: *Self) ?*CoreApp.Tab {
         const core_app = Application.default().core();
-        // Try focused_surface directly — no getActiveSurface call
-        if (core_app.focused_surface) |focused| {
-            if (core_app.tabForSurface(focused)) |tab| return tab;
+        const priv = self.private();
+
+        // Use stored tab ID if available (set during surface init).
+        if (priv.core_tab_id) |id| {
+            return core_app.tabForId(id);
         }
-        // Fall back to last_focused
-        const lf = self.private().last_focused.get() orelse return null;
+
+        // Bootstrap: find tab via focused surface or last_focused.
+        if (core_app.focused_surface) |focused| {
+            if (core_app.tabForSurface(focused)) |tab| {
+                priv.core_tab_id = tab.id;
+                return tab;
+            }
+        }
+        const lf = priv.last_focused.get() orelse return null;
         defer lf.unref();
         const core = lf.core() orelse return null;
-        return core_app.tabForSurface(core);
+        if (core_app.tabForSurface(core)) |tab| {
+            priv.core_tab_id = tab.id;
+            return tab;
+        }
+        return null;
     }
 
     fn onRebuild(ud: ?*anyopaque) callconv(.c) c_int {

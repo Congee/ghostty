@@ -365,7 +365,7 @@ pub const Tab = extern struct {
     //---------------------------------------------------------------
     // Signal handlers
 
-    fn propSplitTree(
+    fn propHasSurfaces(
         split_tree: *SplitTree,
         _: *gobject.ParamSpec,
         self: *Self,
@@ -380,7 +380,6 @@ pub const Tab = extern struct {
                 .{},
                 null,
             );
-            return;
         }
     }
 
@@ -574,7 +573,7 @@ pub const Tab = extern struct {
             // Template Callbacks
             class.bindTemplateCallback("computed_title", &closureComputedTitle);
             class.bindTemplateCallback("notify_active_surface", &propActiveSurface);
-            class.bindTemplateCallback("notify_tree", &propSplitTree);
+            class.bindTemplateCallback("notify_has_surfaces", &propHasSurfaces);
 
             // Signals
             signals.@"close-request".impl.register(.{});

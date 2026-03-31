@@ -2091,29 +2091,8 @@ const Action = struct {
     pub fn focusSurface(value: apprt.action.FocusSurface) bool {
         const rt_surface = value.surface;
         const gtk_surface = rt_surface.surface;
-
-        // Find the window containing this surface and select its tab.
-        const window = ext.getAncestor(
-            Window,
-            gtk_surface.as(gtk.Widget),
-        ) orelse {
-            log.warn("surface is not in a window, ignoring focus_surface", .{});
-            return false;
-        };
-
-        const tab = ext.getAncestor(
-            SplitTree,
-            gtk_surface.as(gtk.Widget),
-        ) orelse return false;
-
-        const tab_view = window.getTabView();
-        const page = tab_view.getPage(tab.as(gtk.Widget));
-
-        const selected = tab_view.getSelectedPage();
-        if (selected != page) {
-            tab_view.setSelectedPage(page);
-        }
-
+        // Single SplitTree per window — just grab focus on the surface.
+        // The SplitTree reads from the active core tab.
         gtk_surface.grabFocus();
         return true;
     }
@@ -2239,7 +2218,7 @@ const Action = struct {
     ) bool {
         switch (target) {
             .app => return false,
-            .surface => |core| {
+            .surface => |_| {
                 const core_app = Application.default().core();
                 const current = core_app.active_tab_index orelse return false;
                 const tab_count = core_app.tabs.items.len;
@@ -2252,18 +2231,9 @@ const Action = struct {
                 const target_i = @mod(current_i + amount, count_i);
                 const to: usize = @intCast(target_i);
 
-                if (!core_app.moveTab(current, to)) return false;
-
-                // Sync Adw.TabView ordering
-                const surface = core.rt_surface.surface;
-                const window = ext.getAncestor(
-                    Window,
-                    surface.as(gtk.Widget),
-                ) orelse return false;
-                const tab_view = window.getTabView();
-                const page = tab_view.getNthPage(@intCast(current));
-                _ = tab_view.reorderPage(page, @intCast(to));
-                return true;
+                // Single SplitTree — reorder is purely a core operation.
+                // Status bar reflects the new order.
+                return core_app.moveTab(current, to);
             },
         }
     }

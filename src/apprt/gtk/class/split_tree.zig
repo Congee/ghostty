@@ -1023,12 +1023,10 @@ pub const SplitTree = extern struct {
             priv.rebuild_source = null;
         }
 
-        // If core tree is empty, emit close-request so the window removes
-        // this page. Don't clear tree_bin here — the page removal path
-        // handles widget cleanup. Clearing it first causes double-unparent.
+        // If core tree is empty, notify has-surfaces so the window closes.
         const has_surfaces = if (self.getCoreTab()) |tab| !tab.tree.isEmpty() else false;
         if (!has_surfaces) {
-            signals.@"close-request".impl.emit(self, null, .{}, null);
+            self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
             return;
         }
 

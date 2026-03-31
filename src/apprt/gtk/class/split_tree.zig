@@ -774,6 +774,13 @@ pub const SplitTree = extern struct {
             ext.boxedFree(Surface.Tree, tree);
             priv.tree = null;
         }
+        if (priv.config) |c| {
+            c.unref();
+            priv.config = null;
+        }
+        if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
+        if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
+        if (priv.tooltip) |v| glib.free(@ptrCast(@constCast(v)));
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -1034,6 +1041,36 @@ pub const SplitTree = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"is-split".impl.param_spec);
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+    }
+
+    /// Set the configuration for this split tree.
+    pub fn setConfig(self: *Self, config: *Config) void {
+        const priv = self.private();
+        if (priv.config) |old| old.unref();
+        priv.config = config;
+        self.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
+    }
+
+    /// Set an override title for this tab.
+    pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
+        const priv = self.private();
+        if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
+        priv.title_override = if (title) |v| glib.ext.dupeZ(u8, v) else null;
+        self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
+    }
+
+    /// Prompt user to set a custom title for this split tree / tab.
+    pub fn promptTabTitle(self: *Self) void {
+        const priv = self.private();
+        const dialog = TitleDialog.new(.tab, priv.title_override orelse priv.title);
+        _ = TitleDialog.signals.set.connect(
+            dialog,
+            *Self,
+            titleDialogSet,
+            self,
+            .{},
+        );
+        dialog.present(self.as(gtk.Widget));
     }
 
     /// Tab close action (previously on Tab GObject).

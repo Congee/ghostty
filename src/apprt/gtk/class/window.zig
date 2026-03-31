@@ -26,7 +26,7 @@ const Application = @import("application.zig").Application;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const Surface = @import("surface.zig").Surface;
-const Tab = @import("tab.zig").Tab;
+// Tab GObject eliminated — SplitTree is the direct TabPage child.
 const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
@@ -429,22 +429,28 @@ pub const Window = extern struct {
         const priv: *Private = self.private();
         const tab_view = priv.tab_view;
 
-        // Create our new tab object
-        const tab = Tab.new(
-            priv.config,
-            .{
-                .command = overrides.command,
-                .working_directory = overrides.working_directory,
-                .title = overrides.title,
-            },
-        );
+        // Create a SplitTree directly (no Tab wrapper).
+        const split_tree: *SplitTree = gobject.ext.newInstance(SplitTree, .{});
+
+        // Set config on the split tree.
+        split_tree.setConfig(if (priv.config) |c| c.ref() else Application.default().getConfig());
+
+        // Create the initial surface in the split tree.
+        split_tree.newSplit(.right, null, .{
+            .command = overrides.command,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => @panic("oom"),
+        };
 
         if (parent_) |p| {
-            // For a new window's first tab, inherit the parent's initial size hints.
             if (context == .window) {
                 surfaceInit(p.rt_surface.gobj(), self);
             }
-            tab.setParentWithContext(p, context);
+            if (split_tree.getActiveSurface()) |surface| {
+                surface.setParent(p, context);
+            }
         }
 
         // Compute tab insertion position via core.
@@ -455,33 +461,38 @@ pub const Window = extern struct {
         else
             .end;
         const position: c_int = @intCast(core_app.resolveNewTabIndex(pos_policy));
-        // Set pending_tab_index so core's addSurface inserts at the same position.
         core_app.pending_tab_index = @intCast(position);
 
-        // Add the page and select it
-        const page = tab_view.insert(tab.as(gtk.Widget), position);
+        // Add to TabView and select.
+        const page = tab_view.insert(split_tree.as(gtk.Widget), position);
         tab_view.setSelectedPage(page);
 
-        // Create some property bindings
-        _ = tab.as(gobject.Object).bindProperty(
+        // Bind title/tooltip from SplitTree to TabPage.
+        _ = split_tree.as(gobject.Object).bindProperty(
             "title",
             page.as(gobject.Object),
             "title",
             .{ .sync_create = true },
         );
-        _ = tab.as(gobject.Object).bindProperty(
+        _ = split_tree.as(gobject.Object).bindProperty(
             "tooltip",
             page.as(gobject.Object),
             "tooltip",
             .{ .sync_create = true },
         );
 
-        // Bind signals
-        const split_tree = tab.getSplitTree();
+        // Bind signals.
         _ = SplitTree.signals.changed.connect(
             split_tree,
             *Self,
             tabSplitTreeChanged,
+            self,
+            .{},
+        );
+        _ = SplitTree.signals.@"close-request".connect(
+            split_tree,
+            *Self,
+            splitTreeCloseRequest,
             self,
             .{},
         );
@@ -490,6 +501,15 @@ pub const Window = extern struct {
         self.connectSurfaceHandlersFromSplitTree(split_tree);
 
         return page;
+    }
+
+    fn splitTreeCloseRequest(
+        split_tree: *SplitTree,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const page = priv.tab_view.getPage(split_tree.as(gtk.Widget));
+        priv.tab_view.closePage(page);
     }
 
     pub fn toggleTabOverview(self: *Self) void {
@@ -848,12 +868,12 @@ pub const Window = extern struct {
     }
 
     /// Get the currently selected tab as a Tab object.
-    fn getSelectedTab(self: *Self) ?*Tab {
+    fn getSelectedTab(self: *Self) ?*SplitTree {
         const priv = self.private();
         const page = priv.tab_view.getSelectedPage() orelse return null;
         const child = page.getChild();
-        assert(gobject.ext.isA(child, Tab));
-        return gobject.ext.cast(Tab, child);
+        assert(gobject.ext.isA(child, SplitTree));
+        return gobject.ext.cast(SplitTree, child);
     }
 
     /// Returns true if this window needs confirmation before quitting.
@@ -865,8 +885,8 @@ pub const Window = extern struct {
         for (0..@intCast(n)) |i| {
             const page = priv.tab_view.getNthPage(@intCast(i));
             const child = page.getChild();
-            const tab = gobject.ext.cast(Tab, child) orelse {
-                log.warn("unexpected non-Tab child in tab view", .{});
+            const tab = gobject.ext.cast(SplitTree, child) orelse {
+                log.warn("unexpected non-SplitTree child in tab view", .{});
                 continue;
             };
             if (tab.getNeedsConfirmQuit()) return true;
@@ -1338,7 +1358,7 @@ pub const Window = extern struct {
     ) callconv(.c) c_int {
         const priv = self.private();
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse
+        const tab = gobject.ext.cast(SplitTree, child) orelse
             return @intFromBool(false);
 
         // If the tab says it doesn't need confirmation then we go ahead
@@ -1383,7 +1403,7 @@ pub const Window = extern struct {
         // Get our current page which MUST be a Tab object.
         const page = priv.tab_view.getSelectedPage() orelse return;
         const child = page.getChild();
-        assert(gobject.ext.isA(child, Tab));
+        assert(gobject.ext.isA(child, SplitTree));
 
         // Setup our binding group. This ensures things like the title
         // are synced from the active tab.
@@ -1408,13 +1428,13 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         // Get the attached page which must be a Tab object.
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const tab = gobject.ext.cast(SplitTree, child) orelse return;
 
-        // Attach listeners for the tab.
-        _ = Tab.signals.@"close-request".connect(
+        // Attach listeners for close-request.
+        _ = SplitTree.signals.@"close-request".connect(
             tab,
             *Self,
-            tabCloseRequest,
+            splitTreeCloseRequest,
             self,
             .{},
         );
@@ -1438,7 +1458,7 @@ pub const Window = extern struct {
         // behavior is consistent with macOS and the previous GTK apprt,
         // but that behavior was all implicit and not documented, so here
         // I am.
-        self.connectSurfaceHandlersFromSplitTree(tab.getSplitTree());
+        self.connectSurfaceHandlersFromSplitTree(tab);
     }
 
     fn tabViewPageDetached(
@@ -1449,7 +1469,7 @@ pub const Window = extern struct {
     ) callconv(.c) void {
         // We need to get the tab to disconnect the signals.
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const tab = gobject.ext.cast(SplitTree, child) orelse return;
         _ = gobject.signalHandlersDisconnectMatched(
             tab.as(gobject.Object),
             .{ .data = true },
@@ -1461,7 +1481,7 @@ pub const Window = extern struct {
         );
 
         // Remove the tree handlers
-        self.disconnectSurfaceHandlersFromSplitTree(tab.getSplitTree());
+        self.disconnectSurfaceHandlersFromSplitTree(tab);
     }
 
     fn tabViewCreateWindow(
@@ -1483,15 +1503,7 @@ pub const Window = extern struct {
         return win.private().tab_view;
     }
 
-    fn tabCloseRequest(
-        tab: *Tab,
-        self: *Self,
-    ) callconv(.c) void {
-        const priv = self.private();
-        const page = priv.tab_view.getPage(tab.as(gtk.Widget));
-        // TODO: connect close page handler to tab to check for confirmation
-        priv.tab_view.closePage(page);
-    }
+
 
     fn tabViewNPages(
         _: *adw.TabView,
@@ -1574,9 +1586,9 @@ pub const Window = extern struct {
             }
         }
 
-        // Get the tab for this surface.
+        // Get the split tree for this surface.
         const tab = ext.getAncestor(
-            Tab,
+            SplitTree,
             surface.as(gtk.Widget),
         ) orelse {
             log.warn("present request surface not found", .{});
@@ -1766,7 +1778,7 @@ pub const Window = extern struct {
         const priv = self.private();
         const page = priv.context_menu_page orelse return;
         const child = page.getChild();
-        const tab = gobject.ext.cast(Tab, child) orelse return;
+        const tab = gobject.ext.cast(SplitTree, child) orelse return;
         tab.promptTabTitle();
     }
 
@@ -1971,7 +1983,7 @@ pub const Window = extern struct {
             gobject.ext.ensureType(DebugWarning);
             gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
-            gobject.ext.ensureType(Tab);
+            // Tab GObject no longer used — SplitTree is the direct TabPage child.
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{

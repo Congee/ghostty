@@ -119,6 +119,21 @@ async function main() {
       return resp === 'PONG'
     })
 
+    // Test 1b: Surface is alive — shell set the terminal title
+    console.log('\n--- Test 1b: Surface alive ---')
+    await sleep(2000) // Give shell time to set title
+    await check('terminal has a title (shell is running)', async () => {
+      const resp = await socketCmd('LIST-TABS')
+      const tabs = JSON.parse(resp)
+      // Shell sets title to cwd (e.g. "~" or "/home/user")
+      return tabs.length > 0 && tabs[0].title.length > 0
+    })
+
+    await check('GET-FOCUSED returns valid surface', async () => {
+      const resp = await socketCmd('GET-FOCUSED')
+      return resp.includes('"tabs"')
+    })
+
     // Test 2: Type into terminal via wtype
     console.log('\n--- Test 2: Keystroke injection ---')
     await check('wtype sends keystrokes', async () => {

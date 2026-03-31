@@ -22,19 +22,10 @@ const apprt = @import("apprt.zig");
 const AppExt = @This();
 
 /// The upstream App, embedded by value.
+/// Fields active_tab_index, pending_tab_index, pending_new_tab,
+/// pending_split_direction live on App (necessary patches) so that
+/// App.addSurface() can read them directly.
 app: App,
-
-/// The currently active (selected) tab index.
-active_tab_index: ?usize = null,
-
-/// The insertion index for the next new tab.
-pending_tab_index: ?usize = null,
-
-/// When true, the next addSurface with .split context is treated as .tab.
-pending_new_tab: bool = false,
-
-/// The direction for the next split.
-pending_split_direction: ?App.SurfaceSplitTree.Split.Direction = null,
 
 pub const NewTabPosition = enum { current, end };
 pub const CloseTabResult = enum { closed, needs_confirm };
@@ -44,18 +35,13 @@ pub fn from(core: *App) *AppExt {
     return @fieldParentPtr("app", core);
 }
 
-/// Const version.
-pub fn fromConst(core: *const App) *const AppExt {
-    return @fieldParentPtr("app", core);
-}
-
 // ── Tab Management ──
 
 /// Select a tab by index. Returns true if selection changed.
 pub fn selectTab(self: *AppExt, index: usize) bool {
     if (index >= self.app.tabs.items.len) return false;
-    if (self.active_tab_index == index) return false;
-    self.active_tab_index = index;
+    if (self.app.active_tab_index == index) return false;
+    self.app.active_tab_index = index;
 
     const tab = &self.app.tabs.items[index];
     if (tab.representativeSurface()) |surface| {
@@ -74,13 +60,13 @@ pub fn moveTab(self: *AppExt, from_idx: usize, to_idx: usize) bool {
     const tab = self.app.tabs.orderedRemove(from_idx);
     self.app.tabs.insert(self.app.alloc, to_idx, tab) catch return false;
 
-    if (self.active_tab_index) |active| {
+    if (self.app.active_tab_index) |active| {
         if (active == from_idx) {
-            self.active_tab_index = to_idx;
+            self.app.active_tab_index = to_idx;
         } else if (from_idx < active and active <= to_idx) {
-            self.active_tab_index = active - 1;
+            self.app.active_tab_index = active - 1;
         } else if (to_idx <= active and active < from_idx) {
-            self.active_tab_index = active + 1;
+            self.app.active_tab_index = active + 1;
         }
     }
     self.app.sendTabsUpdate();
@@ -158,7 +144,7 @@ pub fn closeTabsAfter(self: *AppExt, after: usize) CloseTabResult {
 /// Compute where a new tab should be inserted.
 pub fn resolveNewTabIndex(self: *const AppExt, position: NewTabPosition) usize {
     return switch (position) {
-        .current => if (self.active_tab_index) |idx|
+        .current => if (self.app.active_tab_index) |idx|
             @min(idx + 1, self.app.tabs.items.len)
         else
             self.app.tabs.items.len,

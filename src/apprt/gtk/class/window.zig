@@ -389,7 +389,7 @@ pub const Window = extern struct {
             if (c.@"window-new-tab-position" == .current) .current else .end
         else
             .end;
-        AppExt.from(core_app).pending_tab_index = AppExt.from(core_app).resolveNewTabIndex(pos_policy);
+        core_app.pending_tab_index = AppExt.from(core_app).resolveNewTabIndex(pos_policy);
         priv.split_tree.addNewTab(if (parent_) |p| p.rt_surface.surface else null);
     }
 

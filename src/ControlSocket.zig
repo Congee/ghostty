@@ -322,7 +322,7 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
     }
 
     if (std.mem.startsWith(u8, line, "CLOSE-TAB")) {
-        const idx = self.ext().active_tab_index orelse return "ERR no active tab\n";
+        const idx = self.app.active_tab_index orelse return "ERR no active tab\n";
         const result = self.ext().closeTab(idx);
         return switch (result) {
             .closed => "OK\n",
@@ -335,13 +335,13 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         if (std.mem.eql(u8, arg, "next")) {
             const count = self.app.tabs.items.len;
             if (count <= 1) return "ERR only one tab\n";
-            const current = self.ext().active_tab_index orelse 0;
+            const current = self.app.active_tab_index orelse 0;
             _ = self.ext().selectTab(if (current >= count - 1) 0 else current + 1);
             return "OK\n";
         } else if (std.mem.eql(u8, arg, "previous")) {
             const count = self.app.tabs.items.len;
             if (count <= 1) return "ERR only one tab\n";
-            const current = self.ext().active_tab_index orelse 0;
+            const current = self.app.active_tab_index orelse 0;
             _ = self.ext().selectTab(if (current == 0) count - 1 else current - 1);
             return "OK\n";
         } else {
@@ -419,7 +419,7 @@ fn wakeRenderers(self: *ControlSocket) void {
 /// LIST-TABS: returns JSON array of tab info.
 /// Format: [{"index":0,"title":"zsh","active":true}, ...]
 fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
-    const active_idx = self.ext().active_tab_index;
+    const active_idx = self.app.active_tab_index;
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeByte('[') catch return "ERR buffer overflow\n";

@@ -97,16 +97,16 @@ pub fn main() !MainReturn {
     // Create our app state. AppExt wraps App with custom tab/split logic.
     // Allocate AppExt (which embeds App by value) so @fieldParentPtr works.
     const ext = try alloc.create(AppExt);
-    ext.* = .{
-        .app = undefined,
-        .active_tab_index = null,
-        .pending_tab_index = null,
-        .pending_new_tab = false,
-        .pending_split_direction = null,
-    };
+    ext.* = .{ .app = undefined };
     try ext.app.init(alloc);
     const app: *App = &ext.app;
-    defer app.destroy();
+    // Don't call app.destroy() — it would free &ext.app as a standalone
+    // allocation, but App is embedded inside AppExt. Deinit only, then
+    // free the AppExt allocation.
+    defer {
+        app.deinit();
+        alloc.destroy(ext);
+    }
 
     // Create our runtime app
     var app_runtime: apprt.App = undefined;

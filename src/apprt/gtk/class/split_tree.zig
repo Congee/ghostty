@@ -301,7 +301,7 @@ pub const SplitTree = extern struct {
     ) Allocator.Error!void {
         // Set the split direction on core so addSurface uses the correct direction.
         const core_app = Application.default().core();
-        AppExt.from(core_app).pending_split_direction = @enumFromInt(@intFromEnum(direction));
+        core_app.pending_split_direction = @enumFromInt(@intFromEnum(direction));
 
         // Create our new surface.
         const surface: *Surface = .new(.{
@@ -1148,7 +1148,7 @@ pub const SplitTree = extern struct {
         ) orelse return;
 
         const core_app = Application.default().core();
-        const idx = AppExt.from(core_app).active_tab_index orelse return;
+        const idx = core_app.active_tab_index orelse return;
         const result: AppExt.CloseTabResult = switch (mode) {
             .this => AppExt.from(core_app).closeTab(idx),
             .other => AppExt.from(core_app).closeOtherTabs(idx),
@@ -1310,7 +1310,7 @@ pub const SplitTree = extern struct {
 
         // Build the active tab's widget tree into the stack.
         const core_app = Application.default().core();
-        const active_idx = AppExt.from(core_app).active_tab_index orelse 0;
+        const active_idx = core_app.active_tab_index orelse 0;
         var name_buf: [32:0]u8 = std.mem.zeroes([32:0]u8);
         const active_name = std.fmt.bufPrint(&name_buf, "tab-{d}", .{active_idx}) catch "tab-0";
         name_buf[active_name.len] = 0;

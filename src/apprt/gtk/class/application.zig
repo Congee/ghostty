@@ -1913,7 +1913,7 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const core_app = Application.default().core();
-                const idx = AppExt.from(core_app).active_tab_index orelse return false;
+                const idx = core_app.active_tab_index orelse return false;
 
                 const result: AppExt.CloseTabResult = switch (value) {
                     .this => AppExt.from(core_app).closeTab(idx),
@@ -2066,7 +2066,7 @@ const Action = struct {
                 // Resolve target tab index via core.
                 const tab_count = core_app.tabs.items.len;
                 if (tab_count <= 1) return false;
-                const current = AppExt.from(core_app).active_tab_index orelse 0;
+                const current = core_app.active_tab_index orelse 0;
                 const target_idx: usize = switch (tab) {
                     .previous => if (current == 0) tab_count - 1 else current - 1,
                     .next => if (current == tab_count - 1) 0 else current + 1,
@@ -2230,7 +2230,7 @@ const Action = struct {
             .app => return false,
             .surface => |_| {
                 const core_app = Application.default().core();
-                const current = AppExt.from(core_app).active_tab_index orelse return false;
+                const current = core_app.active_tab_index orelse return false;
                 const tab_count = core_app.tabs.items.len;
                 if (tab_count <= 1) return false;
 

@@ -222,8 +222,8 @@ pub const SplitTree = extern struct {
         /// The tree datastructure containing all of our surface views.
         tree: ?*Surface.Tree,
 
-        // Template bindings
-        tree_bin: *adw.Bin,
+        // Template bindings — GtkStack holds one page per core tab.
+        tab_stack: *gtk.Stack,
 
         /// The core tab ID this split tree belongs to. Set when the first
         /// surface is added and used by getCoreTab to find the tab without
@@ -372,8 +372,8 @@ pub const SplitTree = extern struct {
 
         // Get widget dimensions for ratio computation.
         const priv = self.private();
-        const width = priv.tree_bin.as(gtk.Widget).getWidth();
-        const height = priv.tree_bin.as(gtk.Widget).getHeight();
+        const width = priv.tab_stack.as(gtk.Widget).getWidth();
+        const height = priv.tab_stack.as(gtk.Widget).getHeight();
         if (width == 0 or height == 0) return false;
         const width_f64: f64 = @floatFromInt(width);
         const height_f64: f64 = @floatFromInt(height);
@@ -1044,6 +1044,53 @@ pub const SplitTree = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
     }
 
+    /// Add a new tab page to the stack. Creates a surface, adds it
+    /// to a new stack page so it can realize and initialize. After init,
+    /// addSurface creates the core tab and triggerRebuild switches to it.
+    pub fn addNewTab(self: *Self, parent_: ?*Surface) void {
+        const priv = self.private();
+
+        // Create new surface.
+        const surface: *Surface = .new(.{});
+        defer surface.unref();
+        _ = surface.refSink();
+
+        if (parent_) |p| {
+            if (p.core()) |core| {
+                surface.setParent(core, .split);
+            }
+        }
+
+        // Connect init signal — after addSurface creates the core tab,
+        // we rebuild and switch to it.
+        _ = Surface.signals.init.connect(
+            surface,
+            *Self,
+            surfaceInitialized,
+            self,
+            .{},
+        );
+        _ = Surface.signals.@"close-request".connect(
+            surface,
+            *Self,
+            surfaceCloseRequest,
+            self,
+            .{},
+        );
+
+        // Create a SurfaceScrolledWindow and add as a new stack page.
+        // Use a temporary name — it will be renamed after core assigns a tab.
+        const scrolled = gobject.ext.newInstance(
+            SurfaceScrolledWindow,
+            .{ .surface = surface },
+        );
+        _ = priv.tab_stack.addNamed(scrolled.as(gtk.Widget), "new-tab");
+        priv.tab_stack.setVisibleChildName("new-tab");
+
+        // Update last_focused.
+        priv.last_focused.set(surface);
+    }
+
     /// Clear the cached core tab ID so getCoreTab re-bootstraps
     /// to the current active tab. Called when switching tabs.
     pub fn clearCoreTabId(self: *Self) void {
@@ -1188,7 +1235,10 @@ pub const SplitTree = extern struct {
         // waiting for an idle callback. Delaying teardown can keep the last
         // surface alive during shutdown if the main loop exits first.
         if (priv.tree == null) {
-            priv.tree_bin.setChild(null);
+            // Remove all stack pages when the GTK tree is cleared.
+            while (priv.tab_stack.as(gtk.Widget).getFirstChild()) |child| {
+                priv.tab_stack.remove(child);
+            }
             return;
         }
 
@@ -1236,31 +1286,48 @@ pub const SplitTree = extern struct {
         const priv = self.private();
         priv.rebuild_source = null;
 
-        // Prefer core's tree as source of truth. Fall back to GTK-owned
-        // tree during the transition period (e.g. first surface init).
+        // Build the active tab's widget tree into the stack.
+        const core_app = Application.default().core();
+        const active_idx = core_app.active_tab_index orelse 0;
+        var name_buf: [32:0]u8 = std.mem.zeroes([32:0]u8);
+        const active_name = std.fmt.bufPrint(&name_buf, "tab-{d}", .{active_idx}) catch "tab-0";
+        name_buf[active_name.len] = 0;
+        const active_name_z: [:0]const u8 = name_buf[0..active_name.len :0];
+
         if (self.getCoreTab()) |tab| {
             if (tab.tree.isEmpty()) {
-                priv.tree_bin.setChild(null);
+                // Remove this tab's page from the stack if it exists.
+                if (priv.tab_stack.getChildByName(active_name_z)) |child| {
+                    priv.tab_stack.remove(child);
+                }
             } else {
                 const built = self.buildTree(
                     &tab.tree,
                     tab.tree.zoomed orelse .root,
                 );
                 defer built.deinit();
-                priv.tree_bin.setChild(built.widget);
+
+                // Replace or add this tab's page in the stack.
+                if (priv.tab_stack.getChildByName(active_name_z)) |old| {
+                    priv.tab_stack.remove(old);
+                }
+                _ = priv.tab_stack.addNamed(built.widget, active_name_z);
+                priv.tab_stack.setVisibleChildName(active_name_z);
             }
         } else {
             // Fallback: use GTK-owned tree (during init before core has the surface)
             const tree: *const Surface.Tree = self.private().tree orelse &.empty;
-            if (tree.isEmpty()) {
-                priv.tree_bin.setChild(null);
-            } else {
+            if (!tree.isEmpty()) {
                 const built = self.buildTreeLegacy(
                     tree,
                     tree.zoomed orelse .root,
                 );
                 defer built.deinit();
-                priv.tree_bin.setChild(built.widget);
+                if (priv.tab_stack.getChildByName(active_name_z)) |old| {
+                    priv.tab_stack.remove(old);
+                }
+                _ = priv.tab_stack.addNamed(built.widget, active_name_z);
+                priv.tab_stack.setVisibleChildName(active_name_z);
             }
         }
 
@@ -1479,7 +1546,7 @@ pub const SplitTree = extern struct {
             });
 
             // Bindings
-            class.bindTemplateChildPrivate("tree_bin", .{});
+            class.bindTemplateChildPrivate("tab_stack", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("notify_tree", &propTree);

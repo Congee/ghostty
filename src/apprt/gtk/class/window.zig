@@ -375,9 +375,9 @@ pub const Window = extern struct {
         return &self.private().winproto;
     }
 
-    /// Create a new tab. Uses SplitTree.newSplit to create the surface
-    /// (ensuring it's properly parented in the widget hierarchy), but
-    /// overrides the context to .tab so core creates a new tab.
+    /// Create a new tab. Adds a new page to the SplitTree's stack
+    /// with a fresh surface. The surface initializes (GLArea realizes),
+    /// then addSurface creates the core tab.
     pub fn newTab(self: *Self, parent_: ?*CoreSurface) void {
         const priv = self.private();
         const core_app = Application.default().core();
@@ -389,16 +389,9 @@ pub const Window = extern struct {
         else
             .end;
         core_app.pending_tab_index = core_app.resolveNewTabIndex(pos_policy);
-
-        // Use newSplit to create the surface (proper widget parenting).
-        // The surface context is .split from newSplit, but we override it
-        // to .tab by setting pending_new_tab_context before the surface inits.
         core_app.pending_new_tab = true;
 
-        const gtk_parent: ?*Surface = if (parent_) |p| p.rt_surface.surface else null;
-        priv.split_tree.newSplit(.right, gtk_parent, .{}) catch |err| switch (err) {
-            error.OutOfMemory => @panic("oom"),
-        };
+        priv.split_tree.addNewTab(if (parent_) |p| p.rt_surface.surface else null);
     }
 
     /// Switch the SplitTree to display the current active core tab.

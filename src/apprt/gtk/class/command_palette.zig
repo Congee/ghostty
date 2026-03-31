@@ -15,7 +15,6 @@ const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Window = @import("window.zig").Window;
 const Surface = @import("surface.zig").Surface;
-const Tab = @import("tab.zig").Tab;
 const Config = @import("config.zig").Config;
 
 const log = std.log.scoped(.gtk_ghostty_command_palette);

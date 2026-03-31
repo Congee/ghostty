@@ -136,6 +136,10 @@ tabs: TabList,
 /// Counter for generating unique tab IDs.
 next_tab_id: u32 = 1,
 
+/// The currently active (selected) tab index. Updated by selectTab
+/// and focusSurface. Used by the apprt to sync its tab UI.
+active_tab_index: ?usize = null,
+
 /// The list of sessions. Sessions persist independently of surfaces.
 /// A session remains in this list even when detached (no attached surface).
 sessions: SessionList,
@@ -546,6 +550,8 @@ pub fn focusSurface(self: *App, surface: *Surface) void {
     if (!self.hasSurface(surface)) return;
     const changed = self.focused_surface != surface;
     self.focused_surface = surface;
+    // Keep active_tab_index in sync.
+    self.active_tab_index = self.tabIndexForSurface(surface);
     // Update status bar so the active tab marker (*) moves immediately.
     if (changed) self.sendTabsUpdate();
 }
@@ -614,6 +620,77 @@ fn tabForRtSurface(self: *App, rt_surface: *apprt.Surface) ?*Tab {
         if (tab.findHandle(rt_surface) != null) return tab;
     }
     return null;
+}
+
+/// Select a tab by index. Updates focused_surface to the tab's
+/// representative surface. Returns true if selection changed.
+pub fn selectTab(self: *App, index: usize) bool {
+    if (index >= self.tabs.items.len) return false;
+    if (self.active_tab_index == index) return false;
+    self.active_tab_index = index;
+
+    // Focus the tab's representative surface.
+    const tab = &self.tabs.items[index];
+    if (tab.representativeSurface()) |surface| {
+        self.focused_surface = surface;
+    }
+    self.sendTabsUpdate();
+    return true;
+}
+
+/// Move a tab from one index to another. Returns true if moved.
+pub fn moveTab(self: *App, from: usize, to: usize) bool {
+    if (from >= self.tabs.items.len) return false;
+    if (to >= self.tabs.items.len) return false;
+    if (from == to) return false;
+
+    const tab = self.tabs.orderedRemove(from);
+    self.tabs.insert(self.alloc, to, tab) catch return false;
+
+    // Adjust active_tab_index to follow the moved tab.
+    if (self.active_tab_index) |active| {
+        if (active == from) {
+            self.active_tab_index = to;
+        } else if (from < active and active <= to) {
+            self.active_tab_index = active - 1;
+        } else if (to <= active and active < from) {
+            self.active_tab_index = active + 1;
+        }
+    }
+    self.sendTabsUpdate();
+    return true;
+}
+
+pub const CloseTabResult = enum { closed, needs_confirm };
+
+/// Close a tab by index. Returns `.needs_confirm` if any surface
+/// in the tab requires quit confirmation. Returns `.closed` if the
+/// tab was closed (surfaces destroyed, tab removed).
+pub fn closeTab(self: *App, index: usize) CloseTabResult {
+    if (index >= self.tabs.items.len) return .closed;
+    const tab = &self.tabs.items[index];
+
+    // Check if any surface needs confirmation.
+    var it = tab.surfaceIterator();
+    while (it.next()) |rt_surface| {
+        if (rt_surface.core().needsConfirmQuit()) return .needs_confirm;
+    }
+
+    // Close all surfaces. deleteSurface handles tree removal and
+    // auto-removes the empty tab.
+    var surfaces_buf: [64]*apprt.Surface = undefined;
+    var count: usize = 0;
+    var it2 = tab.surfaceIterator();
+    while (it2.next()) |rt_surface| {
+        if (count < surfaces_buf.len) {
+            surfaces_buf[count] = rt_surface;
+            count += 1;
+        }
+    }
+    for (surfaces_buf[0..count]) |rt_surface| {
+        rt_surface.core().close();
+    }
+    return .closed;
 }
 
 /// Find a tab by its unique ID.

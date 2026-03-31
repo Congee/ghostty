@@ -1041,14 +1041,13 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
             // Persist title on the session so it survives surface destruction.
             // Only refresh status bars if the title actually changed.
-            const old_title = self.session.title;
-            self.session.setTitle(slice) catch |err|
-                log.warn("failed to persist title on session err={}", .{err});
-
-            const changed = if (old_title) |ot|
+            // Compare before setTitle since setTitle frees the old title.
+            const changed = if (self.session.title) |ot|
                 !std.mem.eql(u8, ot, slice)
             else
                 true;
+            self.session.setTitle(slice) catch |err|
+                log.warn("failed to persist title on session err={}", .{err});
             if (changed) self.app.sendTabsUpdate();
 
             _ = try self.rt_app.performAction(

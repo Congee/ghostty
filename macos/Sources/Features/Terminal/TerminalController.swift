@@ -114,8 +114,9 @@ class TerminalController: BaseTerminalController {
             window.surfaceIsZoomed = to.zoomed != nil
         }
 
-        // If our surface tree is empty and no other trees remain, close the window.
-        if to.isEmpty && allTrees.count <= 1 {
+        // If our surface tree is empty, close the window.
+        // Core owns tabs — if this was the last surface, close.
+        if to.isEmpty {
             self.window?.close()
         }
     }
@@ -129,10 +130,6 @@ class TerminalController: BaseTerminalController {
         // We have a special case if our tree is empty to close it immediately.
         // This makes it so that undo is handled properly.
         if newTree.isEmpty {
-            if allTrees.count > 1 {
-                closeTree(surfaceTree)
-                return
-            }
             closeWindowImmediately()
             return
         }
@@ -357,7 +354,13 @@ class TerminalController: BaseTerminalController {
         }
 
         // Add a new surface tree to the parent controller.
-        parentController.addTree(baseConfig: baseConfig)
+        // Core creates the new tab via addSurface with .tab context.
+        // Create a new surface in the existing split tree for now.
+        // TODO: proper tab creation via core when macOS has single-tree model
+        if let ghostty_app = parentController.ghostty.app {
+            let newSurface = Ghostty.SurfaceView(ghostty_app, baseConfig: baseConfig)
+            parentController.surfaceTree = SplitTree(view: newSurface)
+        }
         return parentController
     }
 
@@ -448,13 +451,7 @@ class TerminalController: BaseTerminalController {
             return
         }
 
-        // Multiple trees: close current tree
-        if allTrees.count > 1 {
-            closeTab(nil)
-            return
-        }
-
-        // Only one tree remaining, close the window
+        // Close the window (core manages tabs)
         closeWindow(nil)
     }
 
@@ -782,22 +779,7 @@ class TerminalController: BaseTerminalController {
     }
 
     @IBAction func closeTab(_ sender: Any?) {
-        // Multiple trees: close the active one
-        if allTrees.count > 1 {
-            guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
-                closeTree(surfaceTree)
-                return
-            }
-            confirmClose(
-                messageText: "Close Tab?",
-                informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
-            ) {
-                self.closeTree(self.surfaceTree)
-            }
-            return
-        }
-
-        // Only one tree — close the window
+        // Core owns tabs — just close the window
         closeWindow(sender)
     }
 
@@ -866,15 +848,15 @@ class TerminalController: BaseTerminalController {
 
     @objc private func onFocusSurface(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        // focusSurface checks allTrees internally; no need to pre-check here.
-        guard allTrees.contains(where: { $0.contains(target) }) else { return }
+        guard surfaceTree.contains(target) else { return }
         focusSurface(target)
     }
 
     @objc private func onCloseTree(notification: SwiftUI.Notification) {
+        // Core owns tabs — close the window
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard let tree = allTrees.first(where: { $0.contains(target) }) else { return }
-        closeTree(tree)
+        guard surfaceTree.contains(target) else { return }
+        closeWindow(self)
     }
 
     @objc private func onCloseWindow(notification: SwiftUI.Notification) {

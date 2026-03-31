@@ -45,21 +45,14 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
-    /// All surface trees. The active tree is always `surfaceTree`.
-    /// Zig owns tab identity and ordering; Swift just holds the views.
-    private(set) var allTrees: [SplitTree<Ghostty.SurfaceView>] = []
-
     /// The core split tree for the currently active tab. Read from core via C API.
+    /// Core owns all tab state — Swift just reads it.
     var coreSplitTree: Ghostty.CoreSplitTree? {
         guard let app = ghostty.app else { return nil }
         let activeIdx = ghostty_app_active_tab_index(app)
         guard activeIdx >= 0 else { return nil }
         return Ghostty.CoreSplitTree(app: app, tabIndex: UInt32(activeIdx))
     }
-
-    /// True while switchToTree is executing, suppresses allTrees updates
-    /// in surfaceTreeDidChange to avoid dropping the old tree.
-    private var isSwitchingTrees = false
 
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
@@ -156,9 +149,6 @@ class BaseTerminalController: NSWindowController,
         // Initialize our initial surface.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: base))
-
-        // Initialize the trees collection with the initial surface tree
-        self.allTrees = [self.surfaceTree]
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
@@ -288,15 +278,8 @@ class BaseTerminalController: NSWindowController,
         return newView
     }
 
-    /// Move focus to a surface view, switching trees if needed.
+    /// Move focus to a surface view. Core owns tab switching.
     func focusSurface(_ view: Ghostty.SurfaceView) {
-        // If the target is in a different tree, switch to it first
-        if !surfaceTree.contains(view) {
-            guard let tree = allTrees.first(where: { $0.contains(view) }) else { return }
-            switchToTree(tree)
-        }
-
-        // Move focus to the target surface and activate the window/app
         DispatchQueue.main.async {
             Ghostty.moveFocus(to: view)
             view.window?.makeKeyAndOrderFront(nil)
@@ -315,100 +298,6 @@ class BaseTerminalController: NSWindowController,
             focusedSurface = nil
         }
 
-        // Keep allTrees in sync when splits change within the active tree.
-        // Skip during tree switches — switchToTree manages allTrees itself.
-        if !isSwitchingTrees,
-           let idx = allTrees.firstIndex(where: { $0.root == from.root }) {
-            allTrees[idx] = to
-        }
-    }
-
-    // MARK: Surface Tree Management
-
-    /// Add a new surface tree and switch to it.
-    func addTree(baseConfig: Ghostty.SurfaceConfiguration? = nil) {
-        guard let ghostty_app = ghostty.app else { return }
-        var config = baseConfig ?? Ghostty.SurfaceConfiguration()
-        var initialSize: NSSize? = nil
-
-        // Pass current surface dimensions to avoid 800x600 → real size flash
-        if let currentSurface = surfaceTree.first, let surface = currentSurface.surface {
-            initialSize = currentSurface.bounds.size
-            let surfaceSize = ghostty_surface_size(surface)
-            config.initialWidth = surfaceSize.width_px
-            config.initialHeight = surfaceSize.height_px
-        }
-
-        let newSurface = Ghostty.SurfaceView(ghostty_app, baseConfig: config, initialSize: initialSize)
-        let newTree = SplitTree<Ghostty.SurfaceView>(view: newSurface)
-        allTrees.append(newTree)
-        switchToTree(newTree)
-    }
-
-    /// Switch to a specific surface tree.
-    func switchToTree(_ tree: SplitTree<Ghostty.SurfaceView>) {
-        guard tree.root != surfaceTree.root else { return }
-
-        // Unfocus and occlude current tree's surfaces
-        for view in surfaceTree {
-            view.focusDidChange(false)
-            if let surface = view.surface {
-                ghostty_surface_set_occlusion(surface, false)
-            }
-        }
-
-        // Suppress allTrees update in surfaceTreeDidChange — tree switches
-        // are managed here, not by the didSet handler (which handles
-        // within-tree modifications like split add/remove).
-        isSwitchingTrees = true
-        defer { isSwitchingTrees = false }
-
-        // Switch to the new tree — triggers surfaceTreeDidChange → UI update
-        surfaceTree = tree
-
-        // Mark new tree's surfaces as visible and synchronously update
-        // Zig's focused surface so resolveGotoTab sees the correct current tab.
-        let visible = self.window?.occlusionState.contains(.visible) ?? false
-        for view in surfaceTree {
-            if let surface = view.surface {
-                ghostty_surface_set_occlusion(surface, visible)
-            }
-        }
-        // Synchronously update Zig's focused_surface so resolveGotoTab
-        // sees the correct current tab immediately.
-        if let firstSurface = surfaceTree.first, let surface = firstSurface.surface {
-            ghostty_surface_set_focus(surface, true)
-        }
-
-        // Focus the first surface in the new tree
-        if let surface = surfaceTree.first {
-            DispatchQueue.main.async {
-                Ghostty.moveFocus(to: surface)
-            }
-        }
-    }
-
-
-    /// Close a specific surface tree and its surfaces.
-    func closeTree(_ tree: SplitTree<Ghostty.SurfaceView>) {
-        guard let idx = allTrees.firstIndex(where: { $0.root == tree.root }) else { return }
-        allTrees.remove(at: idx)
-
-        if allTrees.isEmpty {
-            for view in tree { view.closeSurface() }
-            window?.close()
-            return
-        }
-
-        // If closing the active tree, switch to another FIRST so that
-        // deleteSurface → refreshAllStatusBars runs with a visible tree.
-        if tree.root == surfaceTree.root {
-            let targetIdx = min(idx, allTrees.count - 1)
-            switchToTree(allTrees[targetIdx])
-        }
-
-        // Now close removed surfaces
-        for view in tree { view.closeSurface() }
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about

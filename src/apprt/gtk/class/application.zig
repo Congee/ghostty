@@ -14,6 +14,7 @@ const state = &@import("../../../global.zig").state;
 const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
 const CoreApp = @import("../../../App.zig");
+const AppExt = @import("../../../AppExt.zig");
 const configpkg = @import("../../../config.zig");
 const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
@@ -1912,12 +1913,12 @@ const Action = struct {
             .app => return false,
             .surface => |core| {
                 const core_app = Application.default().core();
-                const idx = core_app.active_tab_index orelse return false;
+                const idx = AppExt.from(core_app).active_tab_index orelse return false;
 
-                const result: CoreApp.CloseTabResult = switch (value) {
-                    .this => core_app.closeTab(idx),
-                    .other => core_app.closeOtherTabs(idx),
-                    .right => core_app.closeTabsAfter(idx),
+                const result: AppExt.CloseTabResult = switch (value) {
+                    .this => AppExt.from(core_app).closeTab(idx),
+                    .other => AppExt.from(core_app).closeOtherTabs(idx),
+                    .right => AppExt.from(core_app).closeTabsAfter(idx),
                 };
 
                 switch (result) {
@@ -2065,7 +2066,7 @@ const Action = struct {
                 // Resolve target tab index via core.
                 const tab_count = core_app.tabs.items.len;
                 if (tab_count <= 1) return false;
-                const current = core_app.active_tab_index orelse 0;
+                const current = AppExt.from(core_app).active_tab_index orelse 0;
                 const target_idx: usize = switch (tab) {
                     .previous => if (current == 0) tab_count - 1 else current - 1,
                     .next => if (current == tab_count - 1) 0 else current + 1,
@@ -2078,7 +2079,7 @@ const Action = struct {
                     },
                 };
 
-                if (!core_app.selectTab(target_idx)) return false;
+                if (!AppExt.from(core_app).selectTab(target_idx)) return false;
 
                 // Switch the window's SplitTree to the new active tab.
                 // Use the app's active window since the target surface
@@ -2229,7 +2230,7 @@ const Action = struct {
             .app => return false,
             .surface => |_| {
                 const core_app = Application.default().core();
-                const current = core_app.active_tab_index orelse return false;
+                const current = AppExt.from(core_app).active_tab_index orelse return false;
                 const tab_count = core_app.tabs.items.len;
                 if (tab_count <= 1) return false;
 
@@ -2242,7 +2243,7 @@ const Action = struct {
 
                 // Single SplitTree — reorder is purely a core operation.
                 // Status bar reflects the new order.
-                return core_app.moveTab(current, to);
+                return AppExt.from(core_app).moveTab(current, to);
             },
         }
     }

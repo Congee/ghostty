@@ -22,6 +22,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Surface = @import("Surface.zig");
 const App = @import("App.zig");
+const AppExt = @import("AppExt.zig");
 const renderer = @import("renderer.zig");
 const Component = renderer.State.Component;
 
@@ -45,6 +46,11 @@ app: *App,
 /// The surface to update (for status bar). This is the focused surface.
 /// Updated on each command by looking at app.focused_surface.
 surface_fn: *const fn (*App) ?*Surface,
+
+/// Get the AppExt wrapper for custom tab/split operations.
+fn ext(self: *ControlSocket) *AppExt {
+    return AppExt.from(self.app);
+}
 
 pub fn init(
     alloc: Allocator,
@@ -316,8 +322,8 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
     }
 
     if (std.mem.startsWith(u8, line, "CLOSE-TAB")) {
-        const idx = self.app.active_tab_index orelse return "ERR no active tab\n";
-        const result = self.app.closeTab(idx);
+        const idx = self.ext().active_tab_index orelse return "ERR no active tab\n";
+        const result = self.ext().closeTab(idx);
         return switch (result) {
             .closed => "OK\n",
             .needs_confirm => "ERR needs confirmation\n",
@@ -329,19 +335,19 @@ fn handleCommand(self: *ControlSocket, line: []const u8, resp_buf: []u8) ![]cons
         if (std.mem.eql(u8, arg, "next")) {
             const count = self.app.tabs.items.len;
             if (count <= 1) return "ERR only one tab\n";
-            const current = self.app.active_tab_index orelse 0;
-            _ = self.app.selectTab(if (current >= count - 1) 0 else current + 1);
+            const current = self.ext().active_tab_index orelse 0;
+            _ = self.ext().selectTab(if (current >= count - 1) 0 else current + 1);
             return "OK\n";
         } else if (std.mem.eql(u8, arg, "previous")) {
             const count = self.app.tabs.items.len;
             if (count <= 1) return "ERR only one tab\n";
-            const current = self.app.active_tab_index orelse 0;
-            _ = self.app.selectTab(if (current == 0) count - 1 else current - 1);
+            const current = self.ext().active_tab_index orelse 0;
+            _ = self.ext().selectTab(if (current == 0) count - 1 else current - 1);
             return "OK\n";
         } else {
             const idx = std.fmt.parseInt(usize, arg, 10) catch return "ERR invalid index\n";
             if (idx >= self.app.tabs.items.len) return "ERR invalid index\n";
-            _ = self.app.selectTab(idx); // OK even if already at this index
+            _ = self.ext().selectTab(idx); // OK even if already at this index
             return "OK\n";
         }
     }
@@ -413,7 +419,7 @@ fn wakeRenderers(self: *ControlSocket) void {
 /// LIST-TABS: returns JSON array of tab info.
 /// Format: [{"index":0,"title":"zsh","active":true}, ...]
 fn listTabs(self: *ControlSocket, buf: []u8) []const u8 {
-    const active_idx = self.app.active_tab_index;
+    const active_idx = self.ext().active_tab_index;
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
     w.writeByte('[') catch return "ERR buffer overflow\n";

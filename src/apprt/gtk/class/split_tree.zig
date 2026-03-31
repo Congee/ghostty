@@ -8,6 +8,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const CoreApp = @import("../../../App.zig");
+const AppExt = @import("../../../AppExt.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const configpkg = @import("../../../config.zig");
 const apprt = @import("../../../apprt.zig");
@@ -300,7 +301,7 @@ pub const SplitTree = extern struct {
     ) Allocator.Error!void {
         // Set the split direction on core so addSurface uses the correct direction.
         const core_app = Application.default().core();
-        core_app.pending_split_direction = @enumFromInt(@intFromEnum(direction));
+        AppExt.from(core_app).pending_split_direction = @enumFromInt(@intFromEnum(direction));
 
         // Create our new surface.
         const surface: *Surface = .new(.{
@@ -395,7 +396,7 @@ pub const SplitTree = extern struct {
         if (self.getActiveSurface()) |surface| {
             if (surface.core()) |core| {
                 const core_app = Application.default().core();
-                const result = try core_app.resizeSplit(core.rt_surface, layout, @floatCast(ratio));
+                const result = try AppExt.from(core_app).resizeSplit(core.rt_surface, layout, @floatCast(ratio));
                 if (result) self.triggerRebuild();
                 return result;
             }
@@ -833,7 +834,7 @@ pub const SplitTree = extern struct {
         if (self.getActiveSurface()) |surface| {
             if (surface.core()) |core| {
                 const core_app = Application.default().core();
-                _ = core_app.equalizeSplits(core.rt_surface) catch |err| {
+                _ = AppExt.from(core_app).equalizeSplits(core.rt_surface) catch |err| {
                     log.warn("unable to equalize splits via core: {}", .{err});
                     return;
                 };
@@ -860,7 +861,7 @@ pub const SplitTree = extern struct {
         if (self.getActiveSurface()) |surface| {
             if (surface.core()) |core| {
                 const core_app = Application.default().core();
-                _ = core_app.toggleZoom(core.rt_surface);
+                _ = AppExt.from(core_app).toggleZoom(core.rt_surface);
                 self.triggerRebuild();
                 return;
             }
@@ -1147,11 +1148,11 @@ pub const SplitTree = extern struct {
         ) orelse return;
 
         const core_app = Application.default().core();
-        const idx = core_app.active_tab_index orelse return;
-        const result: CoreApp.CloseTabResult = switch (mode) {
-            .this => core_app.closeTab(idx),
-            .other => core_app.closeOtherTabs(idx),
-            .right => core_app.closeTabsAfter(idx),
+        const idx = AppExt.from(core_app).active_tab_index orelse return;
+        const result: AppExt.CloseTabResult = switch (mode) {
+            .this => AppExt.from(core_app).closeTab(idx),
+            .other => AppExt.from(core_app).closeOtherTabs(idx),
+            .right => AppExt.from(core_app).closeTabsAfter(idx),
         };
         switch (result) {
             .closed => {},
@@ -1264,7 +1265,7 @@ pub const SplitTree = extern struct {
 
         // Use stored tab ID if available (set during surface init).
         if (priv.core_tab_id) |id| {
-            return core_app.tabForId(id);
+            return AppExt.from(core_app).tabForId(id);
         }
 
         // Bootstrap: find tab via focused surface or last_focused.
@@ -1309,7 +1310,7 @@ pub const SplitTree = extern struct {
 
         // Build the active tab's widget tree into the stack.
         const core_app = Application.default().core();
-        const active_idx = core_app.active_tab_index orelse 0;
+        const active_idx = AppExt.from(core_app).active_tab_index orelse 0;
         var name_buf: [32:0]u8 = std.mem.zeroes([32:0]u8);
         const active_name = std.fmt.bufPrint(&name_buf, "tab-{d}", .{active_idx}) catch "tab-0";
         name_buf[active_name.len] = 0;

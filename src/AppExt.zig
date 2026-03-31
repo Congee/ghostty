@@ -224,10 +224,10 @@ pub fn resizeSplitInPlace(
     self: *AppExt,
     rt_surface: *apprt.Surface,
     handle: App.SurfaceSplitTree.Node.Handle,
-    _: f16,
+    ratio: f16,
 ) void {
     const tab = self.tabForRtSurface(rt_surface) orelse return;
-    tab.tree.resizeInPlace(handle, _);
+    tab.tree.resizeInPlace(handle, ratio);
 }
 
 /// Find the tab containing the given apprt surface.

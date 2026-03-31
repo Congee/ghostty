@@ -12,6 +12,7 @@ const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
 
 const App = @import("App.zig");
+const AppExt = @import("AppExt.zig");
 const Ghostty = @import("main_c.zig").Ghostty;
 const state = &@import("global.zig").state;
 
@@ -93,8 +94,18 @@ pub fn main() !MainReturn {
         posix.exit(0);
     }
 
-    // Create our app state
-    const app: *App = try App.create(alloc);
+    // Create our app state. AppExt wraps App with custom tab/split logic.
+    // Allocate AppExt (which embeds App by value) so @fieldParentPtr works.
+    const ext = try alloc.create(AppExt);
+    ext.* = .{
+        .app = undefined,
+        .active_tab_index = null,
+        .pending_tab_index = null,
+        .pending_new_tab = false,
+        .pending_split_direction = null,
+    };
+    try ext.app.init(alloc);
+    const app: *App = &ext.app;
     defer app.destroy();
 
     // Create our runtime app

@@ -14,6 +14,7 @@ const configpkg = @import("../../../config.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
 const input = @import("../../../input.zig");
 const CoreApp = @import("../../../App.zig");
+const AppExt = @import("../../../AppExt.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gtk_version = @import("../gtk_version.zig");
@@ -384,11 +385,11 @@ pub const Window = extern struct {
 
         // Compute insertion position
         const config = if (priv.config) |v| v.get() else null;
-        const pos_policy: CoreApp.NewTabPosition = if (config) |c|
+        const pos_policy: AppExt.NewTabPosition = if (config) |c|
             if (c.@"window-new-tab-position" == .current) .current else .end
         else
             .end;
-        core_app.pending_tab_index = core_app.resolveNewTabIndex(pos_policy);
+        AppExt.from(core_app).pending_tab_index = AppExt.from(core_app).resolveNewTabIndex(pos_policy);
         priv.split_tree.addNewTab(if (parent_) |p| p.rt_surface.surface else null);
     }
 

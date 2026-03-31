@@ -78,8 +78,9 @@ private struct CoreSplitSubtreeView: View {
                 },
                 onEqualize: {
                     // Find first leaf surface for equalize
-                    if let leafSurface = findFirstLeafSurface(node) {
-                        ghostty.splitEqualize(surface: leafSurface)
+                    if let leafSurface = findFirstLeafSurface(node),
+                       let surface = leafSurface.surface {
+                        ghostty.splitEqualize(surface: surface)
                     }
                 }
             )

@@ -1,4 +1,5 @@
 import Cocoa
+import GhosttyKit
 
 extension Ghostty {
     /// A read-only view of the core Zig split tree for a given tab.

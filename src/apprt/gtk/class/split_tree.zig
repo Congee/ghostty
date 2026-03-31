@@ -988,6 +988,9 @@ pub const SplitTree = extern struct {
         _: *Surface,
         self: *Self,
     ) callconv(.c) void {
+        // Clear cached tab ID — addSurface may have created a new tab
+        // and selected it. Re-bootstrap to the active tab.
+        self.clearCoreTabId();
         self.triggerRebuild();
     }
 

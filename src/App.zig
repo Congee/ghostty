@@ -160,6 +160,10 @@ pending_split_direction: ?SurfaceSplitTree.Split.Direction = null,
 /// surface creation and consumed by addSurface. If null, appends.
 pending_tab_index: ?usize = null,
 
+/// When true, the next addSurface with .split context is treated as
+/// .tab instead. Set by the apprt before newSplit to create a new tab.
+pending_new_tab: bool = false,
+
 /// The control socket for external status bar updates and session queries.
 control_socket: ?ControlSocket = null,
 
@@ -357,7 +361,13 @@ pub fn addSurface(
     rt_surface: *apprt.Surface,
     context: apprt.surface.NewSurfaceContext,
 ) Allocator.Error!void {
-    switch (context) {
+    // If pending_new_tab is set, override .split context to .tab.
+    const effective_context = if (self.pending_new_tab and context == .split) blk: {
+        self.pending_new_tab = false;
+        break :blk .tab;
+    } else context;
+
+    switch (effective_context) {
         .split => {
             // Insert into the focused surface's tab tree at the focused position.
             if (self.focused_surface) |focused| {
@@ -389,6 +399,9 @@ pub fn addSurface(
             const idx = self.pending_tab_index;
             self.pending_tab_index = null;
             try self.createTabAt(rt_surface, idx);
+            // Auto-select the newly created tab.
+            const new_idx = if (idx) |i| @min(i, self.tabs.items.len - 1) else self.tabs.items.len - 1;
+            _ = self.selectTab(new_idx);
         },
     }
 
